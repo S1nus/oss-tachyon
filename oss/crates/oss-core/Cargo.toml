@@ -1,0 +1,21 @@
+[package]
+name = "oss-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+hex.workspace = true
+pasta_curves.workspace = true
+rand.workspace = true
+udon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zcash_tachyon.workspace = true
+ragu.workspace = true
+ragu_circuits.workspace = true
+ragu_core.workspace = true
+ragu_primitives.workspace = true
