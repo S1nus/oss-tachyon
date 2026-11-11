@@ -3,6 +3,8 @@
 
 pub mod evidence;
 pub mod protocol;
+pub mod unspent;
 
 pub use evidence::build_epoch;
 pub use protocol::*;
+pub use unspent::prove_unspent;
