@@ -31,8 +31,8 @@ File ownership keeps the parallel tasks from colliding. Shared files
 | T1 | `chain.rs` | `follower.rs`, `archive.rs`, `testing.rs` |
 | T2 | `evidence.rs` | `epochs.rs` |
 | T3 | `spans.rs` | `span_store.rs` |
-| T4 | `unspent.rs` | `unspent_service.rs` |
-| T5 | — | `server.rs`, `main.rs`, `config.rs` |
+| T4 | `unspent.rs` | — |
+| T5 | — | `server.rs`, `main.rs`, `config.rs`, `unspent_service.rs` |
 
 Every task finishes with:
 
@@ -270,7 +270,9 @@ devtool's local mode.
    - Run `UnspentLift` on each later epoch, using
      `witness::unspent_lift(…, value, elapsed_so_far)`.
    - Port the step calls from devtool `proofs.rs`. The result is `n` steps.
-2. **`oss/src/unspent_service.rs`.** Validate the request:
+2. **`oss/src/unspent_service.rs`.** *(Reassigned to T5: it needs T1's
+   archive for the `Spent` check. T4 delivers only the pure part and the
+   tests.)* Validate the request:
    - 1–64 values, nonzero canonical field elements.
    - All epochs closed and ready, or `NotReady`.
    - Inside the archive, or `Unavailable`.
