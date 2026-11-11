@@ -346,7 +346,7 @@ long absence is fast.
 - Check that header fields equal what it asked for: epochs and anchors.
 - Check that `anchorNext` of the newest segment equals its synced entry anchor
   for epoch `t`.
-- Treat `NotReady` as retry-after.
+- Treat `NotReady` as retry-after. If the wallet gives up (bounded retries), it exits non-zero, and stderr contains the exact phrase `OSS not ready`. The workload keys on that phrase.
 
 ### 4.4 Trust and privacy
 

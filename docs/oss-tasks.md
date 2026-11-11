@@ -475,7 +475,7 @@ T10.
   where `ready` is `oss_info.evidenceReadyThrough`. One JSON-RPC call through
   the existing node-RPC client class pointed at `oss_url`. Keep mining while
   not ready.
-- Treat devtool's `NotReady` error as a deferral, not a failure.
+- Treat devtool's `NotReady` error as a deferral, not a failure: a non-zero exit whose stderr contains `OSS not ready`.
 
 **Faucet:** add an optional `oss_url` and pass it the same way. Update the
 README.
