@@ -16,10 +16,10 @@ ExecStart=/opt/tachyon-oss/tachyon-oss \
 # SIGTERM shuts down gracefully. A seal in progress (about 16 s for a full epoch) restarts on the next start.
 KillSignal=SIGTERM
 TimeoutStopSec=60
-# Exit 1 means the follower hit a pruned gap: restarting will not help. Fix it with --backfill-url.
+# Restarts also cover Zakura not being up yet. A pruned-gap error repeats in the
+# journal on every restart until you add --backfill-url.
 Restart=on-failure
-RestartPreventExitStatus=1
-RestartSec=5
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
