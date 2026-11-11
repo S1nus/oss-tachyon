@@ -389,24 +389,32 @@ impl<H: WireHeader> ragu::WireHeader<Fp> for Wire<H> {
     }
 }
 
-/// Lowercase hex of the PCD's ragu mock wire bytes (`Pcd::to_bytes`).
-pub fn pcd_to_hex<H: WireHeader>(pcd: &Pcd<H>) -> Result<String> {
+/// The PCD's ragu mock wire bytes (`Pcd::to_bytes`), e.g. for a BLOB column.
+pub fn pcd_to_bytes<H: WireHeader>(pcd: &Pcd<H>) -> Result<Vec<u8>> {
     let (proof, data) = pcd.clone().into_parts();
-    let bytes = proof
+    proof
         .carry::<Wire<H>>(data)
         .to_bytes()
-        .map_err(|e| anyhow!("cannot encode PCD: {e}"))?;
-    Ok(hex::encode(bytes))
+        .map_err(|e| anyhow!("cannot encode PCD: {e}"))
 }
 
 /// Decodes representation only. Check the header fields and [`verify_pcd`]
 /// before using the result.
-pub fn pcd_from_hex<H: WireHeader>(value: &str) -> Result<Pcd<H>> {
-    let bytes = hex::decode(value)?;
-    let (proof, data) = Pcd::<Wire<H>>::from_bytes(&bytes)
+pub fn pcd_from_bytes<H: WireHeader>(bytes: &[u8]) -> Result<Pcd<H>> {
+    let (proof, data) = Pcd::<Wire<H>>::from_bytes(bytes)
         .map_err(|e| anyhow!("invalid PCD: {e}"))?
         .into_parts();
     Ok(proof.carry(data))
+}
+
+/// Lowercase hex of [`pcd_to_bytes`]: the wire form of a PCD.
+pub fn pcd_to_hex<H: WireHeader>(pcd: &Pcd<H>) -> Result<String> {
+    Ok(hex::encode(pcd_to_bytes(pcd)?))
+}
+
+/// [`pcd_from_bytes`] of hex. Representation only: verify before use.
+pub fn pcd_from_hex<H: WireHeader>(value: &str) -> Result<Pcd<H>> {
+    pcd_from_bytes(&hex::decode(value)?)
 }
 
 // ---------------------------------------------------------------------------
