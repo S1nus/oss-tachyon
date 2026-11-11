@@ -91,11 +91,13 @@ fn connect_with(conn: &Connection, block: &TachyonBlock, capacity: usize) -> Res
 /// height to `connect` again: `height` if nothing was dropped or nothing
 /// survives, else the end height of the last surviving row. That block may
 /// hold stamps of a dropped chunk; `connect` skips the ones still kept.
+///
+/// Opens no transaction: run it in the caller's, so the caller's cursor moves
+/// in the same commit. Run apart, a crash between them replays too little.
 pub fn rewind(conn: &Connection, height: u32) -> Result<u32> {
-    let tx = conn.unchecked_transaction()?;
-    let dropped = tx.execute("DELETE FROM spans WHERE end_height >= ?1", [height])?;
-    let last: Option<u32> = tx.query_row("SELECT MAX(end_height) FROM spans", [], |r| r.get(0))?;
-    tx.commit()?;
+    let dropped = conn.execute("DELETE FROM spans WHERE end_height >= ?1", [height])?;
+    let last: Option<u32> =
+        conn.query_row("SELECT MAX(end_height) FROM spans", [], |r| r.get(0))?;
     Ok(last.filter(|_| dropped > 0).unwrap_or(height))
 }
 

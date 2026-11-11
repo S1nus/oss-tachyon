@@ -1,10 +1,10 @@
 //! The OSS database: one SQLite file in WAL mode. This module owns the schema;
 //! each task owns the queries on its tables.
 
-use std::{path::Path, time::Duration};
+use std::{path::Path, str::FromStr, time::Duration};
 
 use anyhow::{Result, ensure};
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -39,6 +39,27 @@ pub fn open(path: &Path) -> Result<Connection> {
     );
     conn.execute_batch(SCHEMA)?;
     Ok(conn)
+}
+
+/// A read-only connection to a database [`open`] created, for RPC reads.
+pub fn open_read(path: &Path) -> Result<Connection> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(path, flags)?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    Ok(conn)
+}
+
+/// The `meta` value at `key`, parsed.
+pub fn meta<T: FromStr>(conn: &Connection, key: &str) -> Result<Option<T>>
+where
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| {
+        r.get::<_, String>(0)
+    })
+    .optional()?
+    .map(|value| Ok(value.parse()?))
+    .transpose()
 }
 
 #[cfg(test)]
