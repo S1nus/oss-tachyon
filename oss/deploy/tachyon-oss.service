@@ -1,0 +1,25 @@
+# Draft unit for the Tachyon OSS next to Zakura. Adjust the user, paths and node port.
+# Install: copy to /etc/systemd/system/, then `systemctl daemon-reload && systemctl enable --now tachyon-oss`.
+[Unit]
+Description=Tachyon Oblivious Synchronization Service
+After=network-online.target zakurad.service
+Wants=network-online.target
+
+[Service]
+User=tachyon
+UMask=0077
+ExecStart=/opt/tachyon-oss/tachyon-oss \
+    --node-url http://127.0.0.1:18232 \
+    --node-cookie /var/lib/zakura/.cookie \
+    --db /var/lib/tachyon-oss/oss.sqlite \
+    --listen 127.0.0.1:8240
+# SIGTERM shuts down gracefully. A seal in progress (about 16 s for a full epoch) restarts on the next start.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+# Exit 1 means the follower hit a pruned gap: restarting will not help. Fix it with --backfill-url.
+Restart=on-failure
+RestartPreventExitStatus=1
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

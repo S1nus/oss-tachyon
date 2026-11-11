@@ -11,9 +11,14 @@ async fn main() -> anyhow::Result<()> {
         config.db.display(),
         listener.local_addr()?
     );
-    // Returns an error, and exits non-zero, if the follower stops on a pruned gap.
-    oss.serve(listener, async {
-        let _ = tokio::signal::ctrl_c().await;
+    // Ctrl-C or SIGTERM (systemd stop) shuts down gracefully. Returns an error,
+    // and exits non-zero, if the follower stops on a pruned gap.
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    oss.serve(listener, async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
     })
     .await
 }
