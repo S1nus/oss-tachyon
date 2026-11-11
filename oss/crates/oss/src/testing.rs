@@ -4,9 +4,10 @@
 
 use std::{
     collections::BTreeSet,
+    ffi::OsStr,
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -15,9 +16,12 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
+use clap::Parser;
 use oss_core::TachyonBlock;
 use serde_json::{Value, json};
+
+use crate::{builder, config::Config, server, store};
 
 /// Zakura's error text for a pruned body.
 const PRUNED: &str = "Tachyon block data unavailable: body pruned or not retained; use an archive node or previously saved sync data";
@@ -191,6 +195,91 @@ impl NodeData {
             Ok(result) => json!({"jsonrpc": "2.0", "id": request["id"], "result": result}),
             Err((code, message)) => json!({"jsonrpc": "2.0", "id": request["id"],
                 "error": {"code": code, "message": message}}),
+        }
+    }
+}
+
+/// A running OSS on its own thread and runtime, from [`spawn_oss`]. Dropping
+/// it shuts the OSS down and waits for it.
+pub struct OssHandle {
+    db: PathBuf,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<thread::JoinHandle<Result<()>>>,
+}
+
+/// Starts the whole OSS (follower, builder, server) against `node_url` with
+/// the database at `db`, on a free localhost port, with default flags. Returns
+/// its URL once the archive identity is checked. Usable from sync and async
+/// tests alike.
+pub fn spawn_oss(node_url: &str, db: &Path) -> Result<(String, OssHandle)> {
+    let config = Config::try_parse_from(
+        ["tachyon-oss", "--node-url", node_url, "--db"]
+            .map(OsStr::new)
+            .into_iter()
+            .chain([db.as_os_str()]),
+    )?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let (shutdown, stop) = tokio::sync::oneshot::channel::<()>();
+    let (started, start) = std::sync::mpsc::channel();
+    let thread = thread::spawn(move || {
+        tokio::runtime::Runtime::new()?.block_on(async move {
+            let oss = match server::start(&config).await {
+                Ok(oss) => oss,
+                Err(e) => {
+                    let _ = started.send(Err(e));
+                    return Ok(());
+                }
+            };
+            let _ = started.send(Ok(()));
+            let listener = tokio::net::TcpListener::from_std(listener)?;
+            oss.serve(listener, async {
+                let _ = stop.await;
+            })
+            .await
+        })
+    });
+    start
+        .recv()
+        .map_err(|_| anyhow!("the OSS thread failed to start"))??;
+    let handle = OssHandle {
+        db: db.into(),
+        shutdown: Some(shutdown),
+        thread: Some(thread),
+    };
+    Ok((url, handle))
+}
+
+impl OssHandle {
+    /// Waits until `evidenceReadyThrough >= epoch`.
+    pub fn wait_ready(&self, epoch: u32) -> Result<()> {
+        self.wait(builder::READY_THROUGH, epoch)
+    }
+
+    /// Waits until the builder has built `height`: it is archived and its
+    /// spans (and any evidence it closes) are served.
+    pub fn wait_built(&self, height: u32) -> Result<()> {
+        self.wait(builder::BUILDER_HEIGHT, height)
+    }
+
+    fn wait(&self, key: &str, at_least: u32) -> Result<()> {
+        let conn = store::open_read(&self.db)?;
+        for _ in 0..3000 {
+            if store::meta::<u32>(&conn, key)?.is_some_and(|v| v >= at_least) {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        bail!("timed out waiting for {key} >= {at_least}")
+    }
+}
+
+impl Drop for OssHandle {
+    fn drop(&mut self) {
+        let _ = self.shutdown.take().map(|s| s.send(()));
+        if let Some(Ok(Err(e))) = self.thread.take().map(thread::JoinHandle::join) {
+            eprintln!("oss: {e:#}");
         }
     }
 }
