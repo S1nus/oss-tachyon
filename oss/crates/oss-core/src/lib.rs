@@ -3,6 +3,8 @@
 
 pub mod evidence;
 pub mod protocol;
+pub mod spans;
 
 pub use evidence::build_epoch;
 pub use protocol::*;
+pub use spans::{SpanBuilder, SpanChunk, Spans};
