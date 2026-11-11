@@ -29,3 +29,6 @@ axum = "0.8"
 tower-http = { version = "0.6", features = ["compression-gzip"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
 clap = { version = "4.5", features = ["derive"] }
+
+[dev-dependencies]
+oss-core = { path = "../oss-core", features = ["testing"] }

@@ -19,3 +19,7 @@ ragu.workspace = true
 ragu_circuits.workspace = true
 ragu_core.workspace = true
 ragu_primitives.workspace = true
+
+[features]
+# Synthetic chain builders (`evidence::testing`) for other crates' tests.
+testing = []
