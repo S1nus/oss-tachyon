@@ -392,6 +392,34 @@ pub mod testing {
         Ok(())
     }
 
+    /// Mines a block with one stamp of exactly `members`, e.g. a note's `cm`
+    /// or a spend's published nullifiers.
+    pub fn mine_stamp(blocks: &mut Vec<TachyonBlock>, members: &[Tachygram]) -> Result<()> {
+        mine(blocks)?;
+        let block = blocks.last_mut().expect("just mined");
+        let commitment = members
+            .iter()
+            .copied()
+            .collect::<TachygramSetPoly>()
+            .commit();
+        let after = block
+            .entry()?
+            .next_stamp(EpochIndex::new(block.epoch), &commitment)?;
+        let mut bytes = Vec::new();
+        commitment.write(&mut bytes)?;
+        block.stamps.push(TachyonStamp {
+            transaction_index: 0,
+            txid: format!("{:064x}", block.height),
+            tachygram_set: hex::encode(bytes),
+            tachygrams: members
+                .iter()
+                .map(|m| hex::encode(Fp::from(*m).to_bytes()))
+                .collect(),
+        });
+        block.anchor_after = anchor_hex(after);
+        Ok(())
+    }
+
     /// The epoch's blocks plus the next epoch's first block, and its
     /// predecessor anchor: what `build_epoch` takes.
     pub fn epoch_inputs(
