@@ -1,8 +1,20 @@
 # Tachyon Oblivious Synchronization Service (OSS): prototype design
 
-Status: design for handoff, 2026-11-11. Revision 2 switches to the
-retroactive model and keeps the devtool self-prove option. The companion task
-list is [`oss-tasks.md`](oss-tasks.md).
+Status: design for handoff, 2026-11-11. The companion task list is
+[`oss-tasks.md`](oss-tasks.md).
+
+- Revision 2 switches to the retroactive model and keeps the devtool
+  self-prove option.
+- Revision 3 applies the audit fixes:
+  - remote sync waits for the OSS tip;
+  - one spans request per payment;
+  - the builder catches up from a cursor;
+  - local spans start at the spend anchor;
+  - a safe local bucket cache;
+  - a workload gate that handles `null`;
+  - a trimmed protocol;
+  - recomputed `finalized`;
+  - the span chunk-edge rule.
 
 Normative sources: the Tachyon book in `repos/tachyon/book/src/` (`proof-tree.md`
 §Roles, `nullifiers.md` §Delegation, `anchor.md`, `tachygrams.md`) and the code at
@@ -181,13 +193,21 @@ Optional Zakura additions for later (not needed now):
   epoch boundary and rebuilt if a reorg replaces the closing block.
 - **No reorg state for segments.** Unspent segments are computed per request
   from canonical buckets, so they need no reorg handling of their own.
+- **The builder can never miss a block.** The follower's notifications are
+  only wake-ups (a `tokio::sync::watch` of the archive tip). The builder keeps
+  its own cursor, `meta.builder_height`, and reads every block it has not yet
+  processed from the archive. On a reorg, the follower lowers
+  `meta.rewind_from` to the lowest height it disconnected. Before going
+  forward, the builder applies that rewind: it drops spans at or above that
+  height and moves its cursor back.
 
 ## 3. What the OSS computes, and when
 
 The OSS is one process. A follower task writes blocks. One builder thread does
-the ahead-of-time proving. The RPC server reads through read-only SQLite
-connections and runs request proving on a small blocking pool. A
-`tokio::sync::watch` channel carries tip and readiness.
+the ahead-of-time proving, catching up from the archive with its cursor
+(§2.4). The RPC server reads through read-only SQLite connections and runs
+request proving on a small blocking pool. A `tokio::sync::watch` channel
+carries tip and readiness.
 
 1. **Ahead of time, for each canonical block in the open epoch E**
    1. Archive the block JSON and index its tachygrams.
@@ -255,11 +275,11 @@ All methods are stateless. Results for closed epochs can be cached.
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `oss_info` | `{}` | `{protocolVersion:1, genesisHash, activationHeight, epochLength, proofSystem:{tachyon,ragu,mock}, tip:{height,hash,epoch,anchor,entryAnchor}, archiveFromHeight, evidenceReadyThrough:int\|null, node:{height,lagBlocks}}` |
-| `oss_block` | `{height}` or `{hash}` | The **exact** `gettachyonblock` JSON for that canonical block. It works for heights the node has pruned. Devtool's `chain::Block` already deserializes it. |
-| `oss_epoch` | `{epoch}` | `{epoch, firstHeight, lastHeight\|null, entryAnchor, finalAnchor\|null, nextEntryAnchor\|null, closingHash\|null, evidence:{status:"open"\|"building"\|"ready", discriminant?, profiles?:[{depth,bits,members}]}}`. `discriminant` and `profiles` appear only when `ready`. |
+| `oss_info` | `{}` | `{genesisHash, activationHeight, epochLength, proofSystem:{tachyon,ragu,mock}, tip:{height,hash,epoch,anchor,entryAnchor}, archiveFromHeight, evidenceReadyThrough:int\|null, node:{height,lagBlocks}}` |
+| `oss_block` | `{height}` | The stored `gettachyonblock` JSON for that canonical block, served from the raw stored text. `finalized` is recomputed as true when the block is at least 1000 blocks below the tip. It works for heights the node has pruned. Devtool's `chain::Block` already deserializes it. |
+| `oss_epoch` | `{epoch}` | `{epoch, closingHash\|null, evidence:{status:"open"\|"building"\|"ready", discriminant?, profiles?:[{depth,bits,members}]}}`. `discriminant` and `profiles` appear only when `ready`. |
 | `oss_bucket` | `{epoch, profile:{depth,bits}}` | `{pcd}`: the sealed `QrBucket` PCD of that profile |
-| `oss_anchorspans` | `{from: anchor}` | `{epoch, target: anchor, spans:[pcd…]}`: `AnchorSpan` PCDs, applied in order. They lift a stamp anchored at `from` (an entry anchor or any post-stamp anchor of the current or previous epoch) to `target`. The list is empty when `from == target`. |
+| `oss_anchorspans` | `{from:[anchor…]}`: one per spend, all in the same epoch (current or previous), 1 ≤ n ≤ 64 | `{epoch, target, chunks:[pcd…], start:[int\|null…]}`, read in **one** consistent read so every spend lifts to the same `target`. `from[i]` lifts along `chunks[start[i]..]` in order. `start[i]` is null when `from[i] == target`. Each chunk PCD appears once. **Chunk choice:** if `x` is a chunk's start anchor, that chunk is chosen; otherwise the chunk that holds `x` as a member. An anchor that is already in the archive but not yet reached by the span builder returns `NotReady`. |
 | `oss_unspent` | `{epochStart, nullifiers:[hex…]}`: one value per consecutive epoch, 1 ≤ n ≤ 64, all closed | `{pcd, epochStart, epochNext, anchorStart, anchorNext}`: one `ArbitraryUnspent` PCD covering epochs `[epochStart, epochStart+n)`, half-open in anchor space from `entry(epochStart)` to `entry(epochStart+n)` |
 
 Errors use the JSON-RPC `error.code`, with `error.data` as shown:
@@ -267,13 +287,13 @@ Errors use the JSON-RPC `error.code`, with `error.data` as shown:
 | Code | Name | `data` |
 | --- | --- | --- |
 | -32602 | invalid params | message |
-| 1001 | NotReady | `{retryAfterMs, reason}`. An epoch is still open or its evidence is building. Retryable. |
+| 1001 | NotReady | `{retryAfterMs, reason}`. An epoch is still open, its evidence is building, or the span builder has not reached the anchor yet. Retryable. |
 | 1002 | Spent | `{epoch, height, txid}`: one of the values is published |
-| 1003 | Unavailable | The height or epoch is outside the archive |
-| 1004 | Reorged | The requested anchor or epoch is no longer canonical |
+| 1003 | Unavailable | Outside the archive, or no longer canonical (reorged away) |
 
-Limits (configurable): 64 nullifiers per call, a bounded number of concurrent
-`oss_unspent` jobs, 64 MiB response.
+Limits (configurable): 64 nullifiers per `oss_unspent` call, 64 anchors per
+`oss_anchorspans` call, a bounded number of concurrent `oss_unspent` jobs,
+64 MiB response.
 
 ### 4.3 Wallet flows (devtool, in either mode)
 
@@ -297,12 +317,23 @@ reads the wallet's synced tachygram index.
 
 **Spend.**
 
-1. Prove the stamp at the lineage anchor, as today.
-2. Get spans from the stamp's anchor.
-3. Pass them to `ProofStamp::lift`. Spans are applied in order.
+1. Make **one** spans request, listing every spendable's anchor. Use the
+   returned `target` as the plan anchor. Each spend's `ActionLift` uses
+   `chunks[start[i]..]`.
+2. Prove the stamp at that anchor, as today.
+3. Pass the stamp's spans to `ProofStamp::lift`. Spans are applied in order.
 4. Sign, then `sendrawtransaction` to the **node**.
 
-With several spends, use the spans' `target` as the plan anchor.
+Separate requests per spend are forbidden: a block arriving between them would
+give different targets, and the payment would fail to prove.
+
+**Sync in remote mode.**
+
+1. Wait, for at most 10 s, until `oss_info.tip.height` reaches the node's tip.
+2. Sync up to the lower of the two tips. If the OSS tip is lower, report
+   `caught_up: false`.
+3. Read heights from `archiveFromHeight` up to the OSS tip with `oss_block`.
+   Read any lower heights from the node's `gettachyonblock`.
 
 **When it runs.** Lineages advance lazily at payment time, as today. An
 optional `sync` flag can advance them eagerly, so the first payment after a
@@ -386,10 +417,10 @@ spans(from)               -> (target, Vec<Pcd<AnchorSpan>>)
 
 | | Local (no OSS; default when no OSS URL is set) | Remote (`--oss-url`) |
 | --- | --- | --- |
-| Block data for sync | node `gettachyonblock` (as today) | `oss_block`, so it keeps working after the node prunes |
-| Buckets | `oss_core::build_epoch` with `R0 = 1` on first need; all of the epoch's buckets are cached in the wallet's existing `epoch_proofs` table | `oss_epoch` + `oss_bucket` |
+| Block data for sync | node `gettachyonblock` (as today) | `oss_block` within the OSS archive, the node below it (§4.3), so it keeps working after the node prunes |
+| Buckets | `oss_core::build_epoch` with `R0 = 1` on first need. All of the epoch's buckets are written to the wallet's own `epoch_proofs` table. A cached row is used only if `verify_pcd` passes and its header epoch, `anchor_start` and `anchor_next` equal the current chain's `entry(e)` and `entry(e+1)`; otherwise it is deleted and rebuilt. | `oss_epoch` + `oss_bucket` |
 | Unspent segment | `oss_core::prove_unspent` with the local bucket lookup | `oss_unspent` |
-| Spans | `oss_core::SpanBuilder` over the wallet's blocks, on demand (as today) | `oss_anchorspans` |
+| Spans | `oss_core::SpanBuilder::new(epoch, start)`, started at the earliest spend anchor (not the epoch entry), over the wallet's blocks, on demand (as today) | `oss_anchorspans` (one call) |
 | Spent detection | local tachygram index | local tachygram index (unchanged) |
 
 **Deleted in both modes:** the cross-process evidence sharing (`evidence.rs`)
@@ -430,7 +461,7 @@ the shared-cache fix. That is acceptable for a fallback.
 
 | Code | What it does | Disposition |
 | --- | --- | --- |
-| `runner.py::evidence_ready` :245, `prewarm` :222, `evidence_token` :242, and the prewarm-round and defer logic in the mining loop | At each epoch boundary, pauses payments while every wallet syncs and runs `prewarm-epochs`, then checks the evidence generation | **Delete.** Replace with one gate: `oss_info.evidenceReadyThrough >= epoch − 1` before planning payments. Devtool also retries `NotReady`. |
+| `runner.py::evidence_ready` :245, `prewarm` :222, `evidence_token` :242, and the prewarm-round and defer logic in the mining loop | At each epoch boundary, pauses payments while every wallet syncs and runs `prewarm-epochs`, then checks the evidence generation | **Delete.** Replace with one gate before planning payments: pass when `epoch == 0`, otherwise require `evidenceReadyThrough` to be non-null and `>= epoch − 1`. Devtool also retries `NotReady`. |
 | `runtime.py::Devtool.prewarm` :139, `prewarm_slots` :132, `TACHYON_EVIDENCE_DIR` :147 | Shared evidence directory and builder concurrency | **Delete.** Pass `TACHYON_OSS_URL` instead. |
 | `test_prewarm.py` (318 lines), README "Epoch-close prewarm" | — | **Delete or replace** |
 | config | — | Add `oss_url` |

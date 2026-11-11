@@ -125,8 +125,11 @@ Tachyon history with its indexes.
    - In one transaction per block, insert into `blocks` (the verbatim JSON) and
      `tachygrams`.
    - On a parent mismatch, walk back with `getblockhash` and delete rows above
-     the fork. Emit `Disconnected(fork_height + 1)`, then `Connected(h)` for
-     each new block on a `tokio::sync::broadcast` channel.
+     the fork. In the **same transaction**, set `meta.rewind_from` to the
+     lower of its current value and `fork_height + 1`.
+   - After each commit, publish the archive tip height on a
+     `tokio::sync::watch<u32>`. It is only a wake-up; there are no
+     per-block events to lose (design §2.4).
    - Store network identity in `meta`: the genesis hash and the activation
      height and hash. Refuse to start on a mismatch.
    - Start from the activation height. Alternatively, `--start-height` must be
@@ -136,7 +139,8 @@ Tachyon history with its indexes.
    - If the node answers "pruned" for a needed height and no backfill is
      configured, stop with an actionable error. Never skip a height.
 3. **`oss/src/archive.rs`.** Read API:
-   - `tip()`, `block(height)`, `block_by_hash(hash)`.
+   - `tip()`, `block(height)`, `block_json(height)` (the raw stored text, for
+     `oss_block`), `hash(height)`.
    - `epoch_blocks(epoch)`: the epoch's blocks plus the next epoch's first
      block, if present.
    - `closing_hash(epoch)`, `entry_anchor(epoch)`.
@@ -208,29 +212,44 @@ serves the OSS (random `R0`) and devtool's local mode (`R0 = 1`).
 **Goal.** One span builder, used incrementally by the OSS and on demand by
 devtool's local mode.
 
-1. **`oss-core/src/spans.rs`.** `SpanBuilder { epoch, chunk_capacity, chunks }`
-   with:
+1. **`oss-core/src/spans.rs`.** `SpanBuilder::new(epoch, start: Anchor,
+   chunk_capacity)`. The OSS starts it at the epoch's entry anchor; devtool's
+   local mode starts it at the earliest spend anchor, so it never proves stamps
+   it does not need.
    - `push_stamp(before, members, after)`: `AnchorSpanSeed`, then
      `AnchorSpanFuse` into the tail. Roll over at `chunk_capacity`, which
      defaults to `max_polynomial_members()`.
-   - `spans_from(anchor) -> Option<(target, Vec<Pcd<AnchorSpan>>)>`.
+   - `spans_from(&[anchor]) -> Option<(target, chunks: Vec<Pcd<AnchorSpan>>,
+     start: Vec<Option<usize>>)>`, all from one snapshot. It returns `None` if
+     any anchor is unknown.
 
    Port the seed and fuse calls from devtool `proofs.rs::anchor_spans`. Chunk
-   `i` covers `[a_i, a_{i+1}]`. `spans_from(x)` returns chunks `i..` where `x`
-   is `a_i` or a member of chunk `i`.
-2. **`oss/src/span_store.rs`.**
-   - On `Connected(h)`, push the stamps from the block's JSON. Start a new
-     epoch at its entry anchor.
+   `i` covers `[a_i, a_{i+1}]`. Chunk choice for `x`:
+   - If `x == target`, its start is `None`.
+   - Otherwise, the chunk whose start anchor is `x`.
+   - Otherwise, the chunk that holds `x` as a member.
+
+   `chunks` begins at the smallest chosen index; each `start` is relative to
+   it.
+2. **`oss/src/span_store.rs`.** The builder (T5) drives it.
+   - `connect(block)`: push the block's stamps. Start a new epoch's builder at
+     its entry anchor.
+   - `rewind(height)`: delete chunks with `end_height >= height` and rebuild
+     forward from the archive.
    - Persist the chunks, keeping only epochs `current` and `current − 1`.
-   - On `Disconnected(h)`, delete chunks with `end_height >= h` and rebuild
-     forward.
+   - A read `spans_from(&[anchor])` loads one epoch's chunks inside a single
+     read transaction.
 
 **Tests:**
 
-- With `chunk_capacity = 3`, `spans_from(entry)` and `spans_from(each member)`
-  end at the tip, and every PCD verifies.
+- With `chunk_capacity = 3`, `spans_from` for the entry anchor and for every
+  member ends at the tip, and every PCD verifies.
+- An anchor at a chunk edge starts at the later chunk.
+- `x == target` gives a `None` start.
+- Several anchors share one `target` and one `chunks` list.
+- A builder started at a mid-epoch anchor works.
 - Rollover at capacity works.
-- Reorg rebuild works.
+- Rewind and rebuild works.
 - An unknown anchor returns `None`.
 - Lifting a real stamp works. Create it with `FeeSeed` at a member anchor; see
   `repos/tachyon/crates/tachyon/tests/integration/proof.rs::stamp_lift_accepts_only_anchors_the_span_holds`
@@ -294,6 +313,11 @@ can start it after T0 and finish it after T4.
    - Reads use a fresh read-only SQLite connection, or a small pool.
    - `oss_unspent` runs under `spawn_blocking`, behind a semaphore
      (`--max-unspent-jobs`, default 4).
+   - `oss_block` returns `archive.block_json(height)` with `finalized` set to
+     true when `tip − height >= 1000`.
+   - `oss_anchorspans` returns `NotReady` when an unknown anchor's block is in
+     the archive but above `meta.builder_height`. Otherwise an unknown anchor
+     is `Unavailable`.
 2. **`main.rs` and `config.rs`.** CLI flags:
    - `--node-url`, `--node-cookie`, `--db`, `--listen` (default
      `127.0.0.1:8240`).
@@ -302,9 +326,17 @@ can start it after T0 and finish it after T4.
 
    Runtime layout:
    - Spawn the follower on tokio.
-   - Run **one** blocking builder thread that consumes block events in order:
-     spans on `Connected`, `seal_epoch` when an epoch closes, rebuilds on
-     `Disconnected`.
+   - Run **one** blocking builder thread. On each wake-up from the tip
+     `watch`:
+     1. If `meta.rewind_from` is set, call `span_store.rewind(h)`, move
+        `meta.builder_height` below `h`, and clear `rewind_from` with a
+        compare-and-clear.
+     2. Then process each archived height above `builder_height` in order:
+        `span_store.connect`, and `seal_epoch` when that block opens a new
+        epoch.
+     3. Advance `builder_height` after each block.
+
+     Missed wake-ups are harmless (design §2.4).
    - Publish `evidenceReadyThrough` and the tip on a `watch` channel.
    - Shut down cleanly on Ctrl-C.
 3. **`testing.rs` addition.** `spawn_oss(&FakeNode) -> (url, handle)`, so T7
@@ -316,6 +348,9 @@ can start it after T0 and finish it after T4.
 - gzip is negotiated.
 - A 3-epoch run with `FakeNode`, including one reorg.
 - Data persists across a restart.
+- A builder held busy while 50 blocks arrive catches up with correct spans.
+- `oss_anchorspans` answers `NotReady` while the builder is behind.
+- `oss_block` reports `finalized` correctly for deep and shallow blocks.
 
 ---
 
@@ -350,13 +385,25 @@ goes away.
    - Remote mode needs a global `--oss-url` / `--oss-cookie-file`, with env
      fallbacks `TACHYON_OSS_URL` and `TACHYON_OSS_COOKIE`. When neither is set,
      the wallet runs in local mode. There is no config migration.
-   - **Local** uses `build_epoch` with `R0 = 1`. It caches all of the epoch's
-     buckets in the existing `epoch_proofs` table, verifies them on load as
-     today, and calls `oss_core::prove_unspent`.
+   - **Local** uses `build_epoch` with `R0 = 1` and calls
+     `oss_core::prove_unspent`. It caches all of the epoch's buckets:
+     - Add a writer for the `epoch_proofs` table on the **wallet's own**
+       connection; nothing writes it today, and the shared evidence connection
+       is deleted.
+     - On load, use a row only if `verify_pcd` passes and its header epoch,
+       `anchor_start` and `anchor_next` equal the current chain's `entry(e)`
+       and `entry(e+1)`. Otherwise delete it and rebuild (design §4.6).
+   - Local spans use `SpanBuilder::new(epoch, earliest_spend_anchor, …)`, not
+     the epoch entry.
    - **Remote** reuses `rpc::Rpc`: add reqwest `gzip`, and make the 16 MiB
      body cap a field (64 MiB for the OSS). It verifies every PCD and its
-     header fields. In remote mode, block sync's `gettachyonblock` goes to
-     `oss_block`.
+     header fields. Sync follows design §4.3, "Sync in remote mode":
+     1. Wait up to 10 s for the OSS tip to reach the node tip.
+     2. Sync to the lower of the two tips.
+     3. Use `oss_block` from `archiveFromHeight` to the OSS tip, and the node
+        below that.
+   - **Spends in both modes:** one spans request for all spends. Its `target`
+     is the plan anchor.
 3. **Rewrite `proofs::spendable`** once against `Prover`, following the design
    §4.3 table (pages of at most 64 epochs). Delete `lift_closed_epoch` and the
    per-epoch loop.
@@ -378,8 +425,12 @@ goes away.
    - `spent_note_cannot_produce_closed_epoch_absence_evidence`
    - `spent_note_cannot_hide_in_another_routed_bucket`
 
-   Also add one remote-mode test where the node has pruned the note's creation
-   block.
+   Also add these remote-mode tests:
+   - The node has pruned the note's creation block.
+   - A 2-note send.
+   - Sync while the OSS is one block behind the node.
+   - A local-mode cached bucket is rejected and rebuilt after a reorg of its
+     epoch.
 
 **Accept when:**
 
@@ -418,16 +469,19 @@ T10.
 - Add `oss_url` to the config. Pass it as `TACHYON_OSS_URL` in `Devtool._run`'s
   env.
 - Before planning payments, gate on
-  `oss_info.evidenceReadyThrough >= current_epoch − 1`. One JSON-RPC call
-  through the existing node-RPC client class pointed at `oss_url`. Keep mining
-  while not ready.
+  `current_epoch == 0 or (ready is not None and ready >= current_epoch − 1)`,
+  where `ready` is `oss_info.evidenceReadyThrough`. One JSON-RPC call through
+  the existing node-RPC client class pointed at `oss_url`. Keep mining while
+  not ready.
 - Treat devtool's `NotReady` error as a deferral, not a failure.
 
 **Faucet:** add an optional `oss_url` and pass it the same way. Update the
 README.
 
-**Tests:** the existing unit tests pass, plus one test for the readiness gate
-and one for the env passthrough.
+**Tests:** the existing unit tests pass, plus:
+- readiness-gate tests covering epoch 0, `null`, and lagging and ready
+  values;
+- a test for the env passthrough.
 
 ---
 

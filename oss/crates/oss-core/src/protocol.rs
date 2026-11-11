@@ -109,9 +109,10 @@ impl TachyonBlock {
 // lowercase hex of Tachyon wire bytes; hashes and txids are display-order hex;
 // PCDs are `pcd_to_hex`.
 
-pub const PROTOCOL_VERSION: u32 = 1;
 /// Most nullifiers (consecutive epochs) one `oss_unspent` call covers.
 pub const MAX_UNSPENT_NULLIFIERS: usize = 64;
+/// Most `from` anchors one `oss_anchorspans` call takes (one per spend).
+pub const MAX_SPAN_FROMS: usize = 64;
 
 /// `oss_info` params.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -120,7 +121,6 @@ pub struct InfoParams {}
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InfoResult {
-    pub protocol_version: u32,
     pub genesis_hash: String,
     pub activation_height: u32,
     pub epoch_length: u32,
@@ -156,13 +156,11 @@ pub struct NodeStatus {
     pub lag_blocks: u32,
 }
 
-/// `oss_block` params: `{"height": h}` or `{"hash": "…"}`. The result is the
-/// exact `gettachyonblock` JSON ([`TachyonBlock`]).
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum BlockParams {
-    Height(u32),
-    Hash(String),
+/// `oss_block` params. The result is the stored `gettachyonblock` JSON
+/// ([`TachyonBlock`]), with `finalized` recomputed from the current tip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct BlockParams {
+    pub height: u32,
 }
 
 /// `oss_epoch` params.
@@ -175,11 +173,6 @@ pub struct EpochParams {
 #[serde(rename_all = "camelCase")]
 pub struct EpochResult {
     pub epoch: u32,
-    pub first_height: u32,
-    pub last_height: Option<u32>,
-    pub entry_anchor: String,
-    pub final_anchor: Option<String>,
-    pub next_entry_anchor: Option<String>,
     pub closing_hash: Option<String>,
     pub evidence: EpochEvidence,
 }
@@ -232,19 +225,22 @@ pub struct BucketResult {
     pub pcd: String,
 }
 
-/// `oss_anchorspans` params.
+/// `oss_anchorspans` params: one anchor per spend, all in one epoch,
+/// 1 ≤ n ≤ [`MAX_SPAN_FROMS`].
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct AnchorSpansParams {
-    pub from: String,
+    pub from: Vec<String>,
 }
 
-/// `AnchorSpan` PCDs that lift a stamp anchored at `from` to `target`, in
-/// order. Empty when `from == target`.
+/// One consistent read, so every spend lifts to the same `target`.
+/// `from[i]` lifts along `chunks[start[i]..]` in order; `start[i]` is null when
+/// `from[i] == target`. `chunks` holds each `AnchorSpan` PCD once.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct AnchorSpansResult {
     pub epoch: u32,
     pub target: String,
-    pub spans: Vec<String>,
+    pub chunks: Vec<String>,
+    pub start: Vec<Option<u32>>,
 }
 
 /// `oss_unspent` params: one nullifier per consecutive closed epoch from
@@ -268,7 +264,7 @@ pub struct UnspentResult {
     pub anchor_next: String,
 }
 
-/// JSON-RPC `error.code` values. `Unavailable` and `Reorged` carry no data.
+/// JSON-RPC `error.code` values. `Unavailable` carries no data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorCode {
     /// `data`: a message.
@@ -277,19 +273,16 @@ pub enum ErrorCode {
     NotReady = 1001,
     /// `data`: [`SpentData`].
     Spent = 1002,
-    /// The height or epoch is outside the archive.
+    /// Outside the archive, or no longer canonical (reorged away).
     Unavailable = 1003,
-    /// The requested anchor or epoch is no longer canonical.
-    Reorged = 1004,
 }
 
 impl ErrorCode {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 4] = [
         Self::InvalidParams,
         Self::NotReady,
         Self::Spent,
         Self::Unavailable,
-        Self::Reorged,
     ];
 
     pub fn code(self) -> i64 {
@@ -603,14 +596,14 @@ mod tests {
     fn every_method_message_round_trips() -> Result<()> {
         round_trip::<InfoParams>(json!({}))?;
         round_trip::<InfoResult>(json!({
-            "protocolVersion": 1, "genesisHash": H, "activationHeight": 100, "epochLength": 4096,
+            "genesisHash": H, "activationHeight": 100, "epochLength": 4096,
             "proofSystem": {"tachyon": "088f4e1", "ragu": "839cf50", "mock": true},
             "tip": {"height": 5000, "hash": H, "epoch": 1, "anchor": H, "entryAnchor": H2},
             "archiveFromHeight": 100, "evidenceReadyThrough": 0,
             "node": {"height": 5001, "lagBlocks": 1},
         }))?;
         let info = round_trip::<InfoResult>(json!({
-            "protocolVersion": 1, "genesisHash": H, "activationHeight": 100, "epochLength": 4096,
+            "genesisHash": H, "activationHeight": 100, "epochLength": 4096,
             "proofSystem": {"tachyon": "088f4e1", "ragu": "839cf50", "mock": true},
             "tip": {"height": 100, "hash": H, "epoch": 0, "anchor": H, "entryAnchor": H},
             "archiveFromHeight": 100, "evidenceReadyThrough": null,
@@ -620,21 +613,16 @@ mod tests {
 
         assert_eq!(
             round_trip::<BlockParams>(json!({"height": 7}))?,
-            BlockParams::Height(7)
+            BlockParams { height: 7 }
         );
-        round_trip::<BlockParams>(json!({"hash": H}))?;
-        assert!(serde_json::from_value::<BlockParams>(json!({"height": 7, "hash": H})).is_err());
 
         round_trip::<EpochParams>(json!({"epoch": 3}))?;
         let open = round_trip::<EpochResult>(json!({
-            "epoch": 3, "firstHeight": 12388, "lastHeight": null, "entryAnchor": H,
-            "finalAnchor": null, "nextEntryAnchor": null, "closingHash": null,
-            "evidence": {"status": "open"},
+            "epoch": 3, "closingHash": null, "evidence": {"status": "open"},
         }))?;
         assert_eq!(open.evidence.status, EvidenceStatus::Open);
         let ready = round_trip::<EpochResult>(json!({
-            "epoch": 2, "firstHeight": 8292, "lastHeight": 12387, "entryAnchor": H,
-            "finalAnchor": H2, "nextEntryAnchor": H, "closingHash": H2,
+            "epoch": 2, "closingHash": H2,
             "evidence": {"status": "ready", "discriminant": H, "profiles": [
                 {"depth": 1, "bits": 0, "members": 0},
                 {"depth": 2, "bits": 2, "members": 4096},
@@ -646,18 +634,20 @@ mod tests {
             QrProfile::ROOT.descend(true).descend(false)
         );
         round_trip::<EpochResult>(json!({
-            "epoch": 2, "firstHeight": 8292, "lastHeight": 12387, "entryAnchor": H,
-            "finalAnchor": H2, "nextEntryAnchor": H, "closingHash": H2,
-            "evidence": {"status": "building"},
+            "epoch": 2, "closingHash": H2, "evidence": {"status": "building"},
         }))?;
 
         let bucket =
             round_trip::<BucketParams>(json!({"epoch": 2, "profile": {"depth": 1, "bits": 1}}))?;
         assert_eq!(bucket.profile, QrProfile::ROOT.descend(true));
         round_trip::<BucketResult>(json!({"pcd": "abcd"}))?;
-        round_trip::<AnchorSpansParams>(json!({"from": H}))?;
-        round_trip::<AnchorSpansResult>(json!({"epoch": 3, "target": H2, "spans": ["ab", "cd"]}))?;
-        round_trip::<AnchorSpansResult>(json!({"epoch": 3, "target": H, "spans": []}))?;
+        round_trip::<AnchorSpansParams>(json!({"from": [H, H2]}))?;
+        round_trip::<AnchorSpansResult>(json!({
+            "epoch": 3, "target": H2, "chunks": ["ab", "cd"], "start": [0, 1],
+        }))?;
+        round_trip::<AnchorSpansResult>(json!({
+            "epoch": 3, "target": H, "chunks": [], "start": [null],
+        }))?;
         round_trip::<UnspentParams>(json!({"epochStart": 1, "nullifiers": [H, H2]}))?;
         round_trip::<UnspentResult>(json!({
             "pcd": "abcd", "epochStart": 1, "epochNext": 3, "anchorStart": H, "anchorNext": H2,
