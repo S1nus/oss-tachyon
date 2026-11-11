@@ -2,4 +2,7 @@
 
 pub mod archive;
 pub mod epochs;
+pub mod follower;
 pub mod store;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
