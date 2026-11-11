@@ -10,6 +10,7 @@ const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS blocks(height INTEGER PRIMARY KEY, hash TEXT NOT NULL UNIQUE,
   prev_hash TEXT NOT NULL, epoch INTEGER NOT NULL, json TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS blocks_by_epoch ON blocks(epoch);
 CREATE TABLE IF NOT EXISTS tachygrams(tg BLOB NOT NULL, height INTEGER NOT NULL,
   stamp INTEGER NOT NULL, PRIMARY KEY(tg, height));
 CREATE INDEX IF NOT EXISTS tachygrams_by_height ON tachygrams(height);
