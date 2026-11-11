@@ -320,8 +320,8 @@ reads the wallet's synced tachygram index.
 1. Make **one** spans request, listing every spendable's anchor. Use the
    returned `target` as the plan anchor. Each spend's `ActionLift` uses
    `chunks[start[i]..]`.
-2. Prove the stamp at that anchor, as today.
-3. Pass the stamp's spans to `ProofStamp::lift`. Spans are applied in order.
+2. Prove the stamp at that anchor. Every spend reaches it through `ActionLift`, so the stamp is already at `target`.
+3. No `StampLift` is needed. Devtool deleted `lift_stamp` (T7a).
 4. Sign, then `sendrawtransaction` to the **node**.
 
 Separate requests per spend are forbidden: a block arriving between them would
@@ -437,7 +437,7 @@ the shared-cache fix. That is acceptable for a fallback.
 | `evidence.rs` (all 463 lines) | Cross-process SQLite single-flight cache for bucket proofs, with leases, heartbeat thread, generation fencing and `Cargo.lock`-hash namespace | **Delete.** Cross-wallet sharing is now the OSS. |
 | `proofs/epoch.rs` (all 1087 lines): `routing_path` :30, `profiles` :267, `Epoch::read/chunks/build/get` :297–640, `bucket` :640, `prewarm` :677 | Every wallet routes, merges and seals every closed epoch's QR buckets. Fixed `R0 = 1`. | **Move to `oss-core::build_epoch`**, used by the OSS (random `R0`) and by local mode (`R0 = 1`). Drop the intake-level cache (`epoch_nodes`) and `prewarm`. |
 | `proofs.rs::spendable` :74 and `lift_closed_epoch` :241 | One `QrUnspentInit` plus `UnspentBind` plus `SpendableLift` per closed epoch per note | **Rewrite once** against `Prover` (§4.3): one composed segment per page, then one bind and one lift. `QrUnspentInit` moves into `oss-core::prove_unspent`. |
-| `proofs.rs::anchor_spans` :298 | Each payment re-proves `AnchorSpanSeed`/`Fuse` for every stamp from the lineage anchor to the tip | **Move to `oss-core::SpanBuilder`.** The OSS maintains spans incrementally; local mode builds them on demand. `lift_stamp` :372 stays. |
+| `proofs.rs::anchor_spans` :298 | Each payment re-proves `AnchorSpanSeed`/`Fuse` for every stamp from the lineage anchor to the tip | **Move to `oss-core::SpanBuilder`.** The OSS maintains spans incrementally; local mode builds them on demand. `lift_stamp` :372 is deleted, because the stamp is proven at the spans target. |
 | `chain.rs` `Block::validate*` :89–200 | Each wallet validates every block's anchor chain | **Move to `oss-core`.** The OSS and devtool use one copy; devtool's `Block` becomes a re-export. |
 | `store.rs` tables `epoch_proofs` / `epoch_nodes`, `check_evidence_identity` :418 | Per-wallet proof caches, plus the shared-cache identity check | Keep `epoch_proofs` as the local-mode bucket cache. Stop using `epoch_nodes`. Delete `check_evidence_identity`. |
 | `store.rs` tables `blocks`, `tachygrams`, `block_transactions`; `wallet/sync.rs` | Per-wallet chain history and contiguous sync | **Keep**: local mode needs it, and it drives spent detection. In remote mode, block data comes from `oss_block`. A thin sync for remote mode is deferred (T8). |

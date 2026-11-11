@@ -436,7 +436,7 @@ goes away.
 
 **Accept when:**
 
-- `RUSTFLAGS='--cfg zcash_unstable="nutachyon"' cargo test --features tachyon -p tachyon-wallet`
+- `RUSTFLAGS='--cfg zcash_unstable="nutachyon"' cargo test -p tachyon-wallet --lib` passes. The package has no `tachyon` feature; it is the root crate's feature.
   passes.
 - `rg 'prewarm|evidence::' crates/tachyon-wallet/src` finds nothing.
 - The diff is net-negative.
