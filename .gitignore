@@ -1,0 +1,4 @@
+repos/
+target/
+*.sqlite*
+.claude/settings.local.json
