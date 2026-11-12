@@ -8,8 +8,8 @@ publishes code or changes the box needs the operator.
 | Repo | Branch | Head | Notes |
 | --- | --- | --- | --- |
 | S1nus/oss-tachyon (`oss/`) | `main` | see `git log` | `tachyon-oss` binary, `oss-core` library |
-| cnode-agent/zcash-devtool | `c/oss-client` | `0f46caf` | 8 commits on `1716bff`; takes `oss-core` from S1nus/oss-tachyon at `fc9ad81` |
-| cnode-agent/tachyon-workload | `oss` | `6898054` | `oss_url` is **required**; `DEVTOOL_REVISION` is `0f46caf` |
+| cnode-agent/zcash-devtool | `c/oss-client` | `cd7ef27` | 9 commits on `1716bff`; takes `oss-core` from S1nus/oss-tachyon at `0c5653c` |
+| cnode-agent/tachyon-workload | `oss` | `d121bf0` | `oss_url` is **required**; `DEVTOOL_REVISION` is `cd7ef27` |
 | cnode-agent/tachyon-faucet | `oss` | `2a18150` | `oss_url` is optional |
 
 Zakura, tachyon, ragu, common and tachyscan are unchanged.
@@ -90,6 +90,10 @@ Zakura, tachyon, ragu, common and tachyscan are unchanged.
   - OSS disk use per epoch
 - **Local mode still works.** Run one devtool command without `TACHYON_OSS_URL`
   against a spare wallet.
+- **Thin sync and privacy output** (design §4.3, §4.4). Remote-mode devtool
+  prints `privacy warning:` lines on stderr for every OSS request that carries
+  wallet-specific values; `-v` adds `contacting OSS (…)` / `got OSS response
+  (…, 1.2s)` lines. Neither changes the JSON on stdout.
 
 ## 5. Roll back
 
@@ -120,6 +124,9 @@ Zakura, tachyon, ragu, common and tachyscan are unchanged.
   - A stop in the middle of a seal restarts that seal.
 - **Disk:** stale bucket rows from reorged epochs are never deleted, about
   32 MiB per full epoch per reorg.
+- **Thin sync:** a wallet that synced epochs thin needs the OSS to check
+  spends in them, and cannot prove them locally. Thin blocks are still
+  fetched one per request.
 - **Privacy:** see design §4.4. The OSS sees the nullifier runs and the
   creation-bucket requests of remote wallets. Spends of notes created in the
   current epoch prove their anchor spans locally, so the OSS is not told which
