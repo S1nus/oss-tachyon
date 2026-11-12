@@ -19,6 +19,9 @@ Status: design for handoff, 2026-11-11. The companion task list is
   - same-epoch spends prove their spans locally (§4.4);
   - remote mode proves epochs below the OSS archive locally (§4.6);
   - an `oss_unspent` job keeps its slot until its proof ends.
+- Revision 5 adds thin sync (§4.3): closed epochs sync without their
+  tachygrams, and spends in them are looked up with `oss_tachygrams`. It
+  reveals more to the OSS (§4.4), accepted until PIR hides those lookups.
 
 Normative sources: the Tachyon book in `repos/tachyon/book/src/` (`proof-tree.md`
 §Roles, `nullifiers.md` §Delegation, `anchor.md`, `tachygrams.md`) and the code at
@@ -280,7 +283,8 @@ All methods are stateless. Results for closed epochs can be cached.
 | Method | Params | Result |
 | --- | --- | --- |
 | `oss_info` | `{}` | `{genesisHash, activationHeight, epochLength, proofSystem:{tachyon,ragu,mock}, tip:{height,hash,epoch,anchor,entryAnchor}, archiveFromHeight, evidenceReadyThrough:int\|null, node:{height,lagBlocks}}` |
-| `oss_block` | `{height}` | The stored `gettachyonblock` JSON for that canonical block, served from the raw stored text. `finalized` is recomputed as true when the block is at least 1000 blocks below the tip. It works for heights the node has pruned. Devtool's `chain::Block` already deserializes it. |
+| `oss_block` | `{height, thin?}` | The stored `gettachyonblock` JSON for that canonical block, served from the raw stored text. `finalized` is recomputed as true when the block is at least 1000 blocks below the tip. It works for heights the node has pruned. Devtool's `chain::Block` already deserializes it. With `thin: true`, every stamp's `tachygrams` is empty; `tachygramSet` still folds into the anchors (`chain::validate_thin`). |
+| `oss_tachygrams` | `{values:[hex…]}`, 1 ≤ n ≤ 64 | `{heights:[int\|null…]}`: the lowest archived height that publishes each value. Thin sync's spend check; the lookup PIR would replace. |
 | `oss_epoch` | `{epoch}` | `{epoch, closingHash\|null, evidence:{status:"open"\|"building"\|"ready", discriminant?, profiles?:[{depth,bits,members}]}}`. `discriminant` and `profiles` appear only when `ready`. |
 | `oss_bucket` | `{epoch, profile:{depth,bits}}` | `{pcd}`: the sealed `QrBucket` PCD of that profile |
 | `oss_anchorspans` | `{from:[anchor…]}`: one per spend, all in the same epoch (current or previous), 1 ≤ n ≤ 64 | `{epoch, target, chunks:[pcd…], start:[int\|null…]}`, read in **one** consistent read so every spend lifts to the same `target`. `from[i]` lifts along `chunks[start[i]..]` in order. `start[i]` is null when `from[i] == target`. Each chunk PCD appears once. **Chunk choice:** if `x` is a chunk's start anchor, that chunk is chosen; otherwise the chunk that holds `x` as a member. An anchor that is already in the archive but not yet reached by the span builder returns `NotReady`. |
@@ -316,8 +320,9 @@ Only the source of buckets, segments and spans changes.
 
 `Spent` (or a local tachygram-index hit) marks the note spent.
 
-Spent detection for balances stays as it is today: `refresh_note_nullifiers`
-reads the wallet's synced tachygram index.
+Spent detection for balances reads the wallet's synced tachygram index
+(`refresh_note_nullifiers`), and asks `oss_tachygrams` about epochs synced
+thin (below).
 
 **Spend.**
 
@@ -339,6 +344,18 @@ give different targets, and the payment would fail to prove.
    `caught_up: false`.
 3. Read heights from `archiveFromHeight` up to the OSS tip with `oss_block`.
    Read any lower heights from the node's `gettachyonblock`.
+4. **Thin sync.** A height inside the OSS archive whose epoch is already
+   closed is read with `oss_block {thin: true}`, unless the command is a
+   `--from-height` rescan. The current epoch, and everything below the
+   archive, stays full: same-epoch spans and local proving need it.
+   - A located receipt's block comes from the node in full and replaces the
+     thin copy. The thin copy is still requested, so the OSS sees no gap at
+     the note's height.
+   - Once a thin epoch is complete, each note's nullifier for it goes to
+     `oss_tachygrams`, one request per note. A claimed spend is checked in
+     its block, fetched in full and kept; a false claim would hide the note.
+   - Local proving refuses a thin epoch. A wallet that synced thin needs the
+     OSS for those epochs.
 
 **When it runs.** Lineages advance lazily at payment time, as today. An
 optional `sync` flag can advance them eagerly, so the first payment after a
@@ -359,14 +376,16 @@ long absence is fast.
   the wallet verifies, and `UnspentBind` checks the tested values against the
   wallet's own derivation (`nullifiers.md` §Delegation). A malicious OSS can
   only withhold service, or claim `Spent` falsely; the wallet can check a
-  `Spent` claim in its own synced tachygram index. Wrong anchors cannot produce
+  `Spent` claim in its own synced tachygram index, or, for an epoch synced
+  thin, in that block fetched in full. Wrong anchors cannot produce
   a spend that consensus accepts.
 - **The key property of the retroactive model.** Consensus publishes `nf_e`
   only in epoch `e` (as the current nullifier) or in `e−1` (as the next one).
   `oss_unspent` accepts only closed epochs and answers `Spent` if a value is
   already published. So a successful request means none of its values will
   ever appear on chain. The OSS cannot link anything it was shown to a later
-  spend.
+  spend. Thin sync's `oss_tachygrams` gives this up for spends the wallet
+  did not see (below).
 - **What the OSS still learns:**
   - Per request, a run of nullifier values from one note. These are linkable
     to each other, not to `cm`.
@@ -379,6 +398,17 @@ long absence is fast.
     the current epoch starts right after its creation stamp, which would name
     the creating transaction, so its spans are always proven locally.
   - Network metadata linking a client's requests.
+  - **Thin sync** adds more. These are accepted until PIR hides them:
+    - `oss_tachygrams` gets a note's nullifiers for every thin epoch since
+      its creation. A published one tells the OSS which transaction spent the
+      note, so a spend made elsewhere (a restored wallet, a second copy) is
+      linked to this wallet.
+    - The run of `oss_block` heights shows where the wallet's history starts
+      and when it is online.
+    - Receipts' blocks come from the node, which learns them (as before).
+  - Devtool prints a `privacy warning:` line on stderr for every OSS request
+    that carries wallet-specific values. `-v` logs every OSS request and its
+    response time.
 
   Future mitigations: Tor, requesting the bucket and the segments in separate
   sessions, and self-prove mode for sensitive users.
@@ -390,12 +420,14 @@ long absence is fast.
 ### 4.5 Spend detection
 
 The wallet detects spends of its own notes locally. It derives each note's
-per-epoch nullifier and looks it up in its synced tachygram index, which is
-devtool's existing `refresh_note_nullifiers`, unchanged.
+per-epoch nullifier and looks it up in its synced tachygram index
+(`refresh_note_nullifiers`).
 
-The OSS's only role is the `Spent` error on `oss_unspent`, from its archive
-index. That also covers a spend in epoch `e−1` that published `nf_e` as its
-"next" nullifier.
+The OSS answers `Spent` on `oss_unspent`, from its archive index. That also
+covers a spend in epoch `e−1` that published `nf_e` as its "next" nullifier.
+For an epoch synced thin, the index lacks the tachygrams, so the wallet asks
+`oss_tachygrams` instead (§4.3); `nf_e` is published only in epochs `e−1` and
+`e`, so one lookup per complete thin epoch is final.
 
 ### 4.6 Self-prove mode: devtool does not require an OSS
 
@@ -429,7 +461,7 @@ spans(from)               -> (target, Vec<Pcd<AnchorSpan>>)
 | Buckets | `oss_core::build_epoch` with `R0 = 1` on first need. All of the epoch's buckets are written to the wallet's own `epoch_proofs` table. A cached row is used only if `verify_pcd` passes and its header epoch, `anchor_start` and `anchor_next` equal the current chain's `entry(e)` and `entry(e+1)`; otherwise it is deleted and rebuilt. | `oss_epoch` + `oss_bucket` |
 | Unspent segment | `oss_core::prove_unspent` with the local bucket lookup | `oss_unspent`. On `Unavailable` (below the OSS archive), buckets and segments are proven locally, as in the Local column |
 | Spans | `oss_core::SpanBuilder::new(epoch, start)`, started at the earliest spend anchor (not the epoch entry), over the wallet's blocks, on demand (as today) | `oss_anchorspans` (one call) when every spend anchor is the epoch entry; local otherwise (§4.4) |
-| Spent detection | local tachygram index | local tachygram index (unchanged) |
+| Spent detection | local tachygram index | local tachygram index; `oss_tachygrams` for epochs synced thin (§4.3) |
 
 **Deleted in both modes:** the cross-process evidence sharing (`evidence.rs`)
 and the prewarm commands. Sharing across wallets is the OSS's job. Many

@@ -13,7 +13,18 @@ pub fn validate(
     previous: Option<&TachyonBlock>,
     activation: u32,
 ) -> Result<()> {
-    validate_inner(block, previous, activation, false)
+    validate_inner(block, previous, activation, false, false)
+}
+
+/// [`validate`] for a thin block: a stamp without tachygrams folds its
+/// commitment as given, so the anchor chain is still checked, but not the
+/// tachygrams behind it.
+pub fn validate_thin(
+    block: &TachyonBlock,
+    previous: Option<&TachyonBlock>,
+    activation: u32,
+) -> Result<()> {
+    validate_inner(block, previous, activation, false, true)
 }
 
 /// Start at an epoch boundary trusted from the configured node. This checks
@@ -23,7 +34,7 @@ pub fn validate_checkpoint(block: &TachyonBlock, activation: u32) -> Result<()> 
         block.pool_height.is_multiple_of(constants::EPOCH_SIZE),
         "checkpoint must start at an epoch boundary"
     );
-    validate_inner(block, None, activation, true)
+    validate_inner(block, None, activation, true, false)
 }
 
 fn validate_inner(
@@ -31,6 +42,7 @@ fn validate_inner(
     previous: Option<&TachyonBlock>,
     activation: u32,
     checkpoint: bool,
+    thin: bool,
 ) -> Result<()> {
     bytes32(&block.hash)?;
     bytes32(&block.previous_block_hash)?;
@@ -104,6 +116,10 @@ fn validate_inner(
             "stamps are out of order"
         );
         last_index = Some(stamp.transaction_index);
+        if thin && stamp.tachygrams.is_empty() {
+            cursor = cursor.next_stamp(EpochIndex::new(block.epoch), &stamp.commitment()?)?;
+            continue;
+        }
         let members = stamp.members()?;
         member_count = member_count
             .checked_add(members.len())
@@ -156,6 +172,14 @@ mod tests {
             validate(&bad, Some(&blocks[index - 1]), activation).is_err()
         };
         assert!(rejects(1, |b| drop(b.stamps[0].tachygrams.pop())));
+        // A thin copy passes only `validate_thin`, and only with its real commitment.
+        let mut thin = blocks[1].clone();
+        thin.stamps[0].tachygrams.clear();
+        assert!(thin.is_thin() && !blocks[1].is_thin());
+        assert!(validate(&thin, Some(&blocks[0]), activation).is_err());
+        validate_thin(&thin, Some(&blocks[0]), activation)?;
+        thin.stamps[0].tachygram_set = thin.stamps[1].tachygram_set.clone();
+        assert!(validate_thin(&thin, Some(&blocks[0]), activation).is_err());
         assert!(rejects(1, |b| b.stamps.swap(0, 1)));
         assert!(rejects(1, |b| b.previous_block_hash = hex::encode([9; 32])));
         assert!(rejects(1, |b| b.epoch_start_anchor = Some(b.anchor_before.clone())));

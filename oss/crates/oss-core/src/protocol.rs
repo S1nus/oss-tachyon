@@ -96,6 +96,12 @@ impl TachyonStamp {
 }
 
 impl TachyonBlock {
+    /// Whether this is an `oss_block` thin copy: its stamps carry their
+    /// commitments but not their tachygrams. A real stamp has at least three.
+    pub fn is_thin(&self) -> bool {
+        self.stamps.iter().any(|s| s.tachygrams.is_empty())
+    }
+
     pub fn entry(&self) -> Result<Anchor> {
         self.epoch_start_anchor
             .as_deref()
@@ -158,9 +164,27 @@ pub struct NodeStatus {
 
 /// `oss_block` params. The result is the stored `gettachyonblock` JSON
 /// ([`TachyonBlock`]), with `finalized` recomputed from the current tip.
+/// `thin` empties every stamp's `tachygrams`, for thin sync.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct BlockParams {
     pub height: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub thin: bool,
+}
+
+/// Most values one `oss_tachygrams` call looks up.
+pub const MAX_TACHYGRAM_VALUES: usize = 64;
+
+/// `oss_tachygrams` params: 1 ≤ n ≤ [`MAX_TACHYGRAM_VALUES`] tachygram values.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TachygramsParams {
+    pub values: Vec<String>,
+}
+
+/// `heights[i]`: the lowest archived height that publishes `values[i]`, if any.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TachygramsResult {
+    pub heights: Vec<Option<u32>>,
 }
 
 /// `oss_epoch` params.
@@ -611,10 +635,17 @@ mod tests {
         }))?;
         assert_eq!(info.evidence_ready_through, None);
 
+        // `thin` is optional, and left out when false.
         assert_eq!(
             round_trip::<BlockParams>(json!({"height": 7}))?,
-            BlockParams { height: 7 }
+            BlockParams {
+                height: 7,
+                thin: false
+            }
         );
+        assert!(round_trip::<BlockParams>(json!({"height": 7, "thin": true}))?.thin);
+        round_trip::<TachygramsParams>(json!({"values": [H]}))?;
+        round_trip::<TachygramsResult>(json!({"heights": [7, null]}))?;
 
         round_trip::<EpochParams>(json!({"epoch": 3}))?;
         let open = round_trip::<EpochResult>(json!({

@@ -285,6 +285,41 @@ async fn every_method_answers_and_every_error_code_is_produced() -> Result<()> {
 }
 
 #[tokio::test]
+async fn thin_blocks_keep_the_anchor_chain_and_lookups_find_published_values() -> Result<()> {
+    let closed = Closed::new().await?;
+    let (url, height) = (&closed.url, closed.spend_height);
+    let at = |thin| json!({"height": height, "thin": thin});
+    let full: TachyonBlock = call(url, "oss_block", at(false)).await?;
+    let thin: TachyonBlock = call(url, "oss_block", at(true)).await?;
+    assert!(thin.is_thin() && !full.is_thin());
+    assert_eq!(
+        (&thin.hash, &thin.anchor_after, thin.stamps.len()),
+        (&full.hash, &full.anchor_after, full.stamps.len())
+    );
+    let previous = &closed.blocks[(height - 9) as usize];
+    oss_core::chain::validate_thin(&thin, Some(previous), 8)?;
+    assert!(oss_core::chain::validate(&thin, Some(previous), 8).is_err());
+
+    let unknown = nullifiers(3)[2];
+    let values =
+        json!({"values": [hex32(closed.spent[0]), hex32(unknown), hex32(closed.spent[1])]});
+    let found: oss_core::TachygramsResult = call(url, "oss_tachygrams", values).await?;
+    assert_eq!(found.heights, vec![Some(height), None, Some(height)]);
+    for bad in [
+        json!({"values": []}),
+        json!({"values": vec![hex32(unknown); 65]}),
+        json!({"values": [hex::encode([0; 32])]}),
+        json!({"values": ["abc"]}),
+    ] {
+        assert_eq!(
+            code(url, "oss_tachygrams", bad).await?,
+            InvalidParams.code()
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn unspent_proves_closed_epochs_and_answers_spent() -> Result<()> {
     let closed = Closed::new().await?;
     closed.build()?;

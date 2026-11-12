@@ -26,8 +26,9 @@ use axum::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use oss_core::{
     AnchorSpansResult, BlockParams, BucketParams, BucketProfile, BucketResult, EpochEvidence,
-    EpochParams, EpochResult, ErrorCode, EvidenceStatus, InfoResult, MAX_SPAN_FROMS, NodeStatus,
-    NotReadyData, ProofSystem, SpentData, Tip, anchor, anchor_hex, pcd_to_hex,
+    EpochParams, EpochResult, ErrorCode, EvidenceStatus, InfoResult, MAX_SPAN_FROMS,
+    MAX_TACHYGRAM_VALUES, NodeStatus, NotReadyData, ProofSystem, SpentData, TachygramsResult, Tip,
+    anchor, anchor_hex, pcd_to_hex,
 };
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -186,22 +187,35 @@ async fn call(shared: &Shared, method: &str, params: Value) -> Result<Value> {
             let node = shared.node_height.load(Ordering::Relaxed);
             read(shared, move |conn| json(info(conn, node)?)).await
         }
+        // privacy: a wallet's run of heights shows where its history starts
+        // and when it is online.
         "oss_block" => {
-            let BlockParams { height } = parse(params)?;
-            read(shared, move |conn| block(conn, height)).await
+            let BlockParams { height, thin } = parse(params)?;
+            read(shared, move |conn| block(conn, height, thin)).await
         }
         "oss_epoch" => {
             let EpochParams { epoch: e } = parse(params)?;
             read(shared, move |conn| json(epoch(conn, e)?)).await
         }
+        // privacy: the bucket asked for narrows a note commitment to its members.
         "oss_bucket" => {
             let params: BucketParams = parse(params)?;
             read(shared, move |conn| json(bucket(conn, params)?)).await
         }
+        // privacy: shortly before a spend: a closed-epoch note is about to move.
         "oss_anchorspans" => {
             let params: oss_core::AnchorSpansParams = parse(params)?;
             read(shared, move |conn| json(anchor_spans(conn, &params.from)?)).await
         }
+        // privacy: thin sync's spend check. The values are one note's
+        // nullifiers: linkable to each other, and a published one names the
+        // transaction that spent the note. PIR would hide them.
+        "oss_tachygrams" => {
+            let params: oss_core::TachygramsParams = parse(params)?;
+            read(shared, move |conn| json(tachygrams(conn, &params.values)?)).await
+        }
+        // privacy: one note's nullifier run (linkable, and its length dates
+        // the note); `Spent` names the spending transaction.
         "oss_unspent" => {
             let params: oss_core::UnspentParams = parse(params)?;
             let job = read(shared, move |conn| unspent_service::check(conn, &params)).await?;
@@ -265,8 +279,9 @@ fn info(conn: &Connection, node_height: u32) -> Result<InfoResult> {
     })
 }
 
-/// The stored JSON with `finalized` recomputed from the current tip.
-fn block(conn: &Connection, height: u32) -> Result<Value> {
+/// The stored JSON with `finalized` recomputed from the current tip, and no
+/// tachygrams if `thin`.
+fn block(conn: &Connection, height: u32, thin: bool) -> Result<Value> {
     let tx = conn.unchecked_transaction()?;
     let (Some(tip), Some(json)) = (archive::tip(&tx)?, archive::block_json(&tx, height)?) else {
         bail!(Failure::Unavailable(format!(
@@ -275,7 +290,40 @@ fn block(conn: &Connection, height: u32) -> Result<Value> {
     };
     let mut block: Value = serde_json::from_str(&json)?;
     block["finalized"] = json!(tip.height.saturating_sub(height) >= FINALITY);
+    if thin && let Some(stamps) = block["stamps"].as_array_mut() {
+        for stamp in stamps {
+            stamp["tachygrams"] = json!([]);
+        }
+    }
     Ok(block)
+}
+
+/// The lowest archived height that publishes each value.
+fn tachygrams(conn: &Connection, values: &[String]) -> Result<TachygramsResult> {
+    if !(1..=MAX_TACHYGRAM_VALUES).contains(&values.len()) {
+        bail!(Failure::InvalidParams(format!(
+            "expected 1 to {MAX_TACHYGRAM_VALUES} values, got {}",
+            values.len()
+        )));
+    }
+    let values = values
+        .iter()
+        .enumerate()
+        .map(|(i, hex)| {
+            unspent_service::value(hex).ok_or_else(|| {
+                Failure::InvalidParams(format!(
+                    "values[{i}] is not a 32-byte canonical nonzero field element"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // Hits come back per value in height order, so the first is the lowest.
+    let hits = archive::tachygram_heights(conn, &values)?;
+    let heights = values
+        .iter()
+        .map(|v| hits.iter().find(|(hit, ..)| hit == v).map(|&(_, h, _)| h))
+        .collect();
+    Ok(TachygramsResult { heights })
 }
 
 fn epoch(conn: &Connection, epoch: u32) -> Result<EpochResult> {

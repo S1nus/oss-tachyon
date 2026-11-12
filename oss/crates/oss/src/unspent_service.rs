@@ -100,6 +100,7 @@ pub fn prove(conn: &Connection, job: &Job) -> Result<UnspentResult> {
     })
 }
 
-fn value(hex: &str) -> Option<Fp> {
+/// A 32-byte canonical nonzero field element.
+pub(crate) fn value(hex: &str) -> Option<Fp> {
     Fp::from_bytes(bytes32(hex).ok()?).filter(|v| *v != Fp::ZERO)
 }
