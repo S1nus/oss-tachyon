@@ -135,9 +135,8 @@ impl Epoch {
         let mut previous: Option<&TachyonBlock> = None;
         for block in blocks.iter().take_while(|b| b.height <= next.height) {
             // A partial epoch must never be sealed as complete, so check
-            // contiguous coverage through the closing sentinel.
-            // shortcut: only linkage is checked here; full block validation runs at
-            // ingest (T1). Call `chain::validate` here once T1 lands.
+            // contiguous coverage through the closing sentinel. Callers have
+            // already run `chain::validate` on every block.
             if let Some(previous) = previous {
                 ensure!(
                     previous.height.checked_add(1) == Some(block.height),

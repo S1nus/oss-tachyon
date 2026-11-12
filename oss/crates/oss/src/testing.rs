@@ -212,11 +212,17 @@ pub struct OssHandle {
 /// its URL once the archive identity is checked. Usable from sync and async
 /// tests alike.
 pub fn spawn_oss(node_url: &str, db: &Path) -> Result<(String, OssHandle)> {
+    spawn_oss_with(node_url, db, &[])
+}
+
+/// [`spawn_oss`] with extra command-line flags, e.g. `--start-height`.
+pub fn spawn_oss_with(node_url: &str, db: &Path, flags: &[&str]) -> Result<(String, OssHandle)> {
     let config = Config::try_parse_from(
         ["tachyon-oss", "--node-url", node_url, "--db"]
             .map(OsStr::new)
             .into_iter()
-            .chain([db.as_os_str()]),
+            .chain([db.as_os_str()])
+            .chain(flags.iter().map(OsStr::new)),
     )?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     listener.set_nonblocking(true)?;

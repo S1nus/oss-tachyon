@@ -72,10 +72,6 @@ impl SpanBuilder {
         }
     }
 
-    pub fn epoch(&self) -> u32 {
-        self.epoch
-    }
-
     pub fn start(&self) -> Anchor {
         self.start
     }

@@ -115,7 +115,7 @@ pub(crate) struct Shared {
     pub(crate) db: PathBuf,
     /// The Basic-auth password (the cookie token), if auth is on.
     pub(crate) cookie: Option<String>,
-    pub(crate) jobs: Semaphore,
+    pub(crate) jobs: Arc<Semaphore>,
     /// The node's height, polled every second.
     pub(crate) node_height: Arc<AtomicU32>,
 }
@@ -205,8 +205,11 @@ async fn call(shared: &Shared, method: &str, params: Value) -> Result<Value> {
         "oss_unspent" => {
             let params: oss_core::UnspentParams = parse(params)?;
             let job = read(shared, move |conn| unspent_service::check(conn, &params)).await?;
-            let _permit = shared.jobs.acquire().await?;
+            // The slot moves into the proving thread: if the client hangs up,
+            // axum drops this future, but the proof runs on and keeps its slot.
+            let permit = shared.jobs.clone().acquire_owned().await?;
             read(shared, move |conn| {
+                let _permit = permit;
                 json(unspent_service::prove(conn, &job)?)
             })
             .await
@@ -435,7 +438,7 @@ pub async fn start(config: &Config) -> Result<Oss> {
         shared: Arc::new(Shared {
             db: config.db.clone(),
             cookie,
-            jobs: Semaphore::new(config.max_unspent_jobs),
+            jobs: Arc::new(Semaphore::new(config.max_unspent_jobs)),
             node_height,
         }),
     })

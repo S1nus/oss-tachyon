@@ -42,8 +42,9 @@ Zakura, tachyon, ragu, common and tachyscan are unchanged.
      - pass `--backfill-url` pointing at an archive node, or
      - start with `--start-height <epoch boundary inside the retention window>`.
 
-     Notes with older creation epochs then get `Unavailable` in remote mode,
-     and need local mode.
+     The OSS answers `Unavailable` for older epochs. Remote-mode devtool then
+     proves those epochs itself from the wallet's own blocks. That is slower,
+     and it needs blocks the wallet stored before the node pruned them.
 2. **Build and install.**
    ```
    cd oss && cargo build --release --bin tachyon-oss
@@ -128,4 +129,6 @@ Zakura, tachyon, ragu, common and tachyscan are unchanged.
 - **Disk:** stale bucket rows from reorged epochs are never deleted, about
   32 MiB per full epoch per reorg.
 - **Privacy:** see design §4.4. The OSS sees the nullifier runs and the
-  creation-bucket requests of remote wallets.
+  creation-bucket requests of remote wallets. Spends of notes created in the
+  current epoch prove their anchor spans locally, so the OSS is not told which
+  transaction created them. Those spends cost what they did before the OSS.

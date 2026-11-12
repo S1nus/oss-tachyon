@@ -15,6 +15,10 @@ Status: design for handoff, 2026-11-11. The companion task list is
   - a trimmed protocol;
   - recomputed `finalized`;
   - the span chunk-edge rule.
+- Revision 4 applies the code-audit fixes:
+  - same-epoch spends prove their spans locally (§4.4);
+  - remote mode proves epochs below the OSS archive locally (§4.6);
+  - an `oss_unspent` job keeps its slot until its proof ends.
 
 Normative sources: the Tachyon book in `repos/tachyon/book/src/` (`proof-tree.md`
 §Roles, `nullifiers.md` §Delegation, `anchor.md`, `tachygrams.md`) and the code at
@@ -319,7 +323,8 @@ reads the wallet's synced tachygram index.
 
 1. Make **one** spans request, listing every spendable's anchor. Use the
    returned `target` as the plan anchor. Each spend's `ActionLift` uses
-   `chunks[start[i]..]`.
+   `chunks[start[i]..]`. Ask the OSS only when every anchor is the current
+   epoch's entry anchor; otherwise prove the spans locally (§4.4).
 2. Prove the stamp at that anchor. Every spend reaches it through `ActionLift`, so the stamp is already at `target`.
 3. No `StampLift` is needed. Devtool deleted `lift_stamp` (T7a).
 4. Sign, then `sendrawtransaction` to the **node**.
@@ -368,8 +373,11 @@ long absence is fast.
   - Roughly when the wallet came online.
   - The approximate bucket that holds a wallet's `cm` in its creation epoch,
     from `oss_bucket`. That narrows `cm` to roughly 8k members.
-  - The spans request reveals the stamp's anchor shortly before the
-    transaction is published.
+  - A spans request, shortly before the transaction is published, tells the
+    OSS that a closed-epoch note is about to be spent. Wallets send only the
+    epoch's entry anchor, which every such note shares. A note created in
+    the current epoch starts right after its creation stamp, which would name
+    the creating transaction, so its spans are always proven locally.
   - Network metadata linking a client's requests.
 
   Future mitigations: Tor, requesting the bucket and the segments in separate
@@ -419,8 +427,8 @@ spans(from)               -> (target, Vec<Pcd<AnchorSpan>>)
 | --- | --- | --- |
 | Block data for sync | node `gettachyonblock` (as today) | `oss_block` within the OSS archive, the node below it (§4.3), so it keeps working after the node prunes |
 | Buckets | `oss_core::build_epoch` with `R0 = 1` on first need. All of the epoch's buckets are written to the wallet's own `epoch_proofs` table. A cached row is used only if `verify_pcd` passes and its header epoch, `anchor_start` and `anchor_next` equal the current chain's `entry(e)` and `entry(e+1)`; otherwise it is deleted and rebuilt. | `oss_epoch` + `oss_bucket` |
-| Unspent segment | `oss_core::prove_unspent` with the local bucket lookup | `oss_unspent` |
-| Spans | `oss_core::SpanBuilder::new(epoch, start)`, started at the earliest spend anchor (not the epoch entry), over the wallet's blocks, on demand (as today) | `oss_anchorspans` (one call) |
+| Unspent segment | `oss_core::prove_unspent` with the local bucket lookup | `oss_unspent`. On `Unavailable` (below the OSS archive), buckets and segments are proven locally, as in the Local column |
+| Spans | `oss_core::SpanBuilder::new(epoch, start)`, started at the earliest spend anchor (not the epoch entry), over the wallet's blocks, on demand (as today) | `oss_anchorspans` (one call) when every spend anchor is the epoch entry; local otherwise (§4.4) |
 | Spent detection | local tachygram index | local tachygram index (unchanged) |
 
 **Deleted in both modes:** the cross-process evidence sharing (`evidence.rs`)

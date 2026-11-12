@@ -12,13 +12,13 @@ use std::{fmt, path::PathBuf, time::Duration};
 use anyhow::{Context, Result, ensure};
 use oss_core::{TachyonBlock, bytes32, chain};
 use reqwest::{Client, Url};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json, value::RawValue};
 use tokio::sync::watch;
 use zcash_tachyon::constants::EPOCH_SIZE;
 
-use crate::archive;
+use crate::{archive, store};
 
 const MAX_BODY: usize = 16 * 1024 * 1024;
 const POLL: Duration = Duration::from_secs(1);
@@ -193,15 +193,8 @@ impl Follower {
         backfill: Option<Node>,
         start_height: Option<u32>,
     ) -> Result<Self> {
-        let stored = conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'activation_height'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?;
-        let activation = match stored {
-            Some(height) => height.parse()?,
+        let activation = match store::meta(&conn, "activation_height")? {
+            Some(height) => height,
             // The tip's body is always retained, and it reports activation.
             None => {
                 let tip = node.height().await?;
@@ -385,10 +378,7 @@ mod tests {
     use zcash_tachyon::pasta::Fp;
 
     use super::*;
-    use crate::{
-        store,
-        testing::{FakeNode, TempDb, served},
-    };
+    use crate::testing::{FakeNode, TempDb, served};
 
     async fn follower(
         db: &TempDb,
@@ -430,13 +420,7 @@ mod tests {
     }
 
     fn rewind_from(conn: &Connection) -> Result<Option<String>> {
-        Ok(conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'rewind_from'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?)
+        store::meta(conn, "rewind_from")
     }
 
     #[tokio::test]
