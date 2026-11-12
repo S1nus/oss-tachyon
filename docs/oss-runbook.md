@@ -9,8 +9,8 @@ publishes code or changes the box needs the operator.
 | --- | --- | --- | --- |
 | S1nus/oss-tachyon (`oss/`) | `main` | see `git log` | `tachyon-oss` binary, `oss-core` library |
 | cnode-agent/zcash-devtool | `c/oss-client` | `0f46caf` | 8 commits on `1716bff`; takes `oss-core` from S1nus/oss-tachyon at `fc9ad81` |
-| cnode-agent/tachyon-workload | `oss` | `42de24a` | `oss_url` is **required** |
-| cnode-agent/tachyon-faucet | `oss` | `2a18150` | `oss_url` is optional |
+| cnode-agent/tachyon-workload | `oss` | `6898054` | `oss_url` is **required**; `DEVTOOL_REVISION` is `0f46caf` |
+| cnode-agent/tachyon-faucet | `oss` (local only) | `2a18150` | `oss_url` is optional. Not pushed: no write access to the fork. The faucet can stay on `main` with its current devtool binary |
 
 Zakura, tachyon, ragu, common and tachyscan are unchanged.
 
@@ -21,10 +21,9 @@ Zakura, tachyon, ragu, common and tachyscan are unchanged.
 2. **Done:** devtool takes `oss-core`, and `oss` for its tests, from that
    repo by git rev. When the OSS code changes, bump both `rev`s in
    `crates/tachyon-wallet/Cargo.toml`, rebuild, and rerun devtool's tests.
-3. **Done for devtool:** `c/oss-client` is pushed. Still to push: workload
-   `oss` and faucet `oss` to the cnode-agent forks. Open PRs if wanted.
-4. **Bump the devtool pin.** In the workload, set `DEVTOOL_REVISION` to the new
-   devtool head and commit.
+3. **Done:** devtool `c/oss-client` and workload `oss` are pushed. The faucet
+   `oss` branch is not (no write access to cnode-agent/tachyon-faucet).
+4. **Done:** the workload's `DEVTOOL_REVISION` is the new devtool head.
 
 ## 2. Start the OSS (next to Zakura)
 
