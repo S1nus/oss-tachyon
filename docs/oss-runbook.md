@@ -7,29 +7,22 @@ publishes code or changes the box needs the operator.
 
 | Repo | Branch | Head | Notes |
 | --- | --- | --- | --- |
-| this repo (`oss/`) | `main` | see `git log` | `tachyon-oss` binary, `oss-core` library |
-| cnode-agent/zcash-devtool | `c/oss-client` | `660f770` | 6 commits on `1716bff`; depends on `oss-core` **by path** |
+| S1nus/oss-tachyon (`oss/`) | `main` | see `git log` | `tachyon-oss` binary, `oss-core` library |
+| cnode-agent/zcash-devtool | `c/oss-client` | `0f46caf` | 8 commits on `1716bff`; takes `oss-core` from S1nus/oss-tachyon at `fc9ad81` |
 | cnode-agent/tachyon-workload | `oss` | `42de24a` | `oss_url` is **required** |
 | cnode-agent/tachyon-faucet | `oss` | `2a18150` | `oss_url` is optional |
 
 Zakura, tachyon, ragu, common and tachyscan are unchanged.
 
-## 1. Publish (operator decision: nothing has been pushed)
+## 1. Publish
 
-1. **Host this repo** somewhere the box can fetch, for example a new
-   `cnode-agent/tachyon-oss`. It holds `oss/` and `docs/`. `repos/` is
-   gitignored.
-2. **Switch devtool's path dependencies** to that host. In
-   `crates/tachyon-wallet/Cargo.toml`:
-   ```toml
-   oss-core = { git = "https://github.com/<org>/tachyon-oss", rev = "<main sha>" }
-   # dev-dependency, only needed for devtool's tests:
-   oss = { git = "https://github.com/<org>/tachyon-oss", rev = "<main sha>", features = ["testing"] }
-   ```
-   Run `cargo update -p oss-core -p oss`, run devtool's test suite again, and
-   commit on `c/oss-client`.
-3. **Push** devtool `c/oss-client`, workload `oss` and faucet `oss` to the
-   cnode-agent forks. Open PRs if wanted.
+1. **Done:** this repo is at https://github.com/S1nus/oss-tachyon (`oss/` and
+   `docs/`; `repos/` is gitignored).
+2. **Done:** devtool takes `oss-core`, and `oss` for its tests, from that
+   repo by git rev. When the OSS code changes, bump both `rev`s in
+   `crates/tachyon-wallet/Cargo.toml`, rebuild, and rerun devtool's tests.
+3. **Done for devtool:** `c/oss-client` is pushed. Still to push: workload
+   `oss` and faucet `oss` to the cnode-agent forks. Open PRs if wanted.
 4. **Bump the devtool pin.** In the workload, set `DEVTOOL_REVISION` to the new
    devtool head and commit.
 
