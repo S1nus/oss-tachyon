@@ -8,8 +8,8 @@ publishes code or changes the box needs the operator.
 | Repo | Branch | Head | Notes |
 | --- | --- | --- | --- |
 | S1nus/oss-tachyon (`oss/`) | `main` | see `git log` | `tachyon-oss` binary, `oss-core` library |
-| cnode-agent/zcash-devtool | `c/oss-client` | `cd7ef27` | 9 commits on `1716bff`; takes `oss-core` from S1nus/oss-tachyon at `0c5653c` |
-| cnode-agent/tachyon-workload | `oss` | `d121bf0` | `oss_url` is **required**; `DEVTOOL_REVISION` is `cd7ef27` |
+| cnode-agent/zcash-devtool | `c/oss-client` | `90861cf` | 11 commits on `1716bff`; takes `oss-core` from S1nus/oss-tachyon at `42a3859`, and needs an OSS with `oss_blocks`: upgrade the OSS first |
+| cnode-agent/tachyon-workload | `oss` | `c63d739` | `oss_url` is **required**; `DEVTOOL_REVISION` is `90861cf` |
 | cnode-agent/tachyon-faucet | `oss` | `2a18150` | `oss_url` is optional |
 
 Zakura, tachyon, ragu, common and tachyscan are unchanged.
@@ -125,8 +125,10 @@ Zakura, tachyon, ragu, common and tachyscan are unchanged.
 - **Disk:** stale bucket rows from reorged epochs are never deleted, about
   32 MiB per full epoch per reorg.
 - **Thin sync:** a wallet that synced epochs thin needs the OSS to check
-  spends in them, and cannot prove them locally. Thin blocks are still
-  fetched one per request.
+  spends in them, and cannot prove them locally.
+- **Sync speed:** remote sync reads 100 blocks per `oss_blocks` request and
+  one node `getblock` batch. Local mode, and heights below the OSS archive,
+  still fetch one block per request.
 - **Privacy:** see design §4.4. The OSS sees the nullifier runs and the
   creation-bucket requests of remote wallets. Spends of notes created in the
   current epoch prove their anchor spans locally, so the OSS is not told which
