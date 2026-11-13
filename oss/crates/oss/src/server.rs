@@ -25,10 +25,10 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use oss_core::{
-    AnchorSpansResult, BlockParams, BucketParams, BucketProfile, BucketResult, EpochEvidence,
-    EpochParams, EpochResult, ErrorCode, EvidenceStatus, InfoResult, MAX_SPAN_FROMS,
-    MAX_TACHYGRAM_VALUES, NodeStatus, NotReadyData, ProofSystem, SpentData, TachygramsResult, Tip,
-    anchor, anchor_hex, pcd_to_hex,
+    AnchorSpansResult, BlockParams, BlocksParams, BucketParams, BucketProfile, BucketResult,
+    EpochEvidence, EpochParams, EpochResult, ErrorCode, EvidenceStatus, InfoResult, MAX_BLOCKS,
+    MAX_SPAN_FROMS, MAX_TACHYGRAM_VALUES, NodeStatus, NotReadyData, ProofSystem, SpentData,
+    TachygramsResult, Tip, anchor, anchor_hex, pcd_to_hex,
 };
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -54,6 +54,9 @@ const MAX_REQUEST: usize = 1 << 20;
 const RETRY_AFTER_MS: u64 = 1000;
 /// Zakura's finalization depth.
 const FINALITY: u32 = 1000;
+/// An `oss_blocks` reply stops past this much stored JSON, well under
+/// devtool's 64 MiB OSS body cap.
+const MAX_BLOCKS_BYTES: usize = 16 << 20;
 
 /// An RPC error with a design §4.2 code. Any other error answers -32603.
 #[derive(Debug)]
@@ -191,7 +194,18 @@ async fn call(shared: &Shared, method: &str, params: Value) -> Result<Value> {
         // and when it is online.
         "oss_block" => {
             let BlockParams { height, thin } = parse(params)?;
-            read(shared, move |conn| block(conn, height, thin)).await
+            read(shared, move |conn| {
+                Ok(blocks(conn, height, 1, thin)?.remove(0))
+            })
+            .await
+        }
+        // privacy: as `oss_block`, minus the gaps in a run of single heights.
+        "oss_blocks" => {
+            let BlocksParams { from, count, thin } = parse(params)?;
+            read(shared, move |conn| {
+                Ok(json!({"blocks": blocks(conn, from, count, thin)?}))
+            })
+            .await
         }
         "oss_epoch" => {
             let EpochParams { epoch: e } = parse(params)?;
@@ -279,23 +293,42 @@ fn info(conn: &Connection, node_height: u32) -> Result<InfoResult> {
     })
 }
 
-/// The stored JSON with `finalized` recomputed from the current tip, and no
-/// tachygrams if `thin`.
-fn block(conn: &Connection, height: u32, thin: bool) -> Result<Value> {
-    let tx = conn.unchecked_transaction()?;
-    let (Some(tip), Some(json)) = (archive::tip(&tx)?, archive::block_json(&tx, height)?) else {
-        bail!(Failure::Unavailable(format!(
-            "block {height} is not archived"
+/// The stored JSON of blocks `from..from + count`, read in one snapshot, with
+/// `finalized` recomputed from the current tip and no tachygrams if `thin`.
+/// Ends early at the archive tip or past [`MAX_BLOCKS_BYTES`].
+fn blocks(conn: &Connection, from: u32, count: u32, thin: bool) -> Result<Vec<Value>> {
+    if !(1..=MAX_BLOCKS).contains(&count) {
+        bail!(Failure::InvalidParams(format!(
+            "expected 1 to {MAX_BLOCKS} blocks, got {count}"
         )));
-    };
-    let mut block: Value = serde_json::from_str(&json)?;
-    block["finalized"] = json!(tip.height.saturating_sub(height) >= FINALITY);
-    if thin && let Some(stamps) = block["stamps"].as_array_mut() {
-        for stamp in stamps {
-            stamp["tachygrams"] = json!([]);
+    }
+    let tx = conn.unchecked_transaction()?;
+    let tip = archive::tip(&tx)?.map_or(0, |tip| tip.height);
+    let mut blocks = Vec::new();
+    let mut bytes = 0;
+    for height in from..from.saturating_add(count) {
+        let Some(json) = archive::block_json(&tx, height)? else {
+            break;
+        };
+        bytes += json.len();
+        let mut block: Value = serde_json::from_str(&json)?;
+        block["finalized"] = json!(tip.saturating_sub(height) >= FINALITY);
+        if thin && let Some(stamps) = block["stamps"].as_array_mut() {
+            for stamp in stamps {
+                stamp["tachygrams"] = json!([]);
+            }
+        }
+        blocks.push(block);
+        if bytes >= MAX_BLOCKS_BYTES {
+            break;
         }
     }
-    Ok(block)
+    if blocks.is_empty() {
+        bail!(Failure::Unavailable(format!(
+            "block {from} is not archived"
+        )));
+    }
+    Ok(blocks)
 }
 
 /// The lowest archived height that publishes each value.

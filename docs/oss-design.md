@@ -22,6 +22,9 @@ Status: design for handoff, 2026-11-11. The companion task list is
 - Revision 5 adds thin sync (§4.3): closed epochs sync without their
   tachygrams, and spends in them are looked up with `oss_tachygrams`. It
   reveals more to the OSS (§4.4), accepted until PIR hides those lookups.
+- Revision 6 adds `oss_blocks` (§4.2): remote sync reads pages of up to 100
+  blocks, and checks each page against the node in one `getblock` batch,
+  instead of three round trips per block.
 
 Normative sources: the Tachyon book in `repos/tachyon/book/src/` (`proof-tree.md`
 §Roles, `nullifiers.md` §Delegation, `anchor.md`, `tachygrams.md`) and the code at
@@ -284,6 +287,7 @@ All methods are stateless. Results for closed epochs can be cached.
 | --- | --- | --- |
 | `oss_info` | `{}` | `{genesisHash, activationHeight, epochLength, proofSystem:{tachyon,ragu,mock}, tip:{height,hash,epoch,anchor,entryAnchor}, archiveFromHeight, evidenceReadyThrough:int\|null, node:{height,lagBlocks}}` |
 | `oss_block` | `{height, thin?}` | The stored `gettachyonblock` JSON for that canonical block, served from the raw stored text. `finalized` is recomputed as true when the block is at least 1000 blocks below the tip. It works for heights the node has pruned. Devtool's `chain::Block` already deserializes it. With `thin: true`, every stamp's `tachygrams` is empty; `tachygramSet` still folds into the anchors (`chain::validate_thin`). |
+| `oss_blocks` | `{from, count, thin?}`, 1 ≤ count ≤ 100 | `{blocks:[…]}`: blocks `from..from+count` as `oss_block` serves them, read in one snapshot. Fewer at the archive tip or past 16 MiB of stored JSON; `from` must be archived (else `Unavailable`). |
 | `oss_tachygrams` | `{values:[hex…]}`, 1 ≤ n ≤ 64 | `{heights:[int\|null…]}`: the lowest archived height that publishes each value. Thin sync's spend check; the lookup PIR would replace. |
 | `oss_epoch` | `{epoch}` | `{epoch, closingHash\|null, evidence:{status:"open"\|"building"\|"ready", discriminant?, profiles?:[{depth,bits,members}]}}`. `discriminant` and `profiles` appear only when `ready`. |
 | `oss_bucket` | `{epoch, profile:{depth,bits}}` | `{pcd}`: the sealed `QrBucket` PCD of that profile |
@@ -342,8 +346,11 @@ give different targets, and the payment would fail to prove.
 1. Wait, for at most 10 s, until `oss_info.tip.height` reaches the node's tip.
 2. Sync up to the lower of the two tips. If the OSS tip is lower, report
    `caught_up: false`.
-3. Read heights from `archiveFromHeight` up to the OSS tip with `oss_block`.
-   Read any lower heights from the node's `gettachyonblock`.
+3. Read heights from `archiveFromHeight` up to the OSS tip with
+   `oss_blocks`, a page of up to 100 at a time. One JSON-RPC batch of
+   `getblock <height> 1` to the node checks each block's hash and gives its
+   transaction list. Read any lower heights from the node's
+   `gettachyonblock`, one block per request.
 4. **Thin sync.** A height inside the OSS archive whose epoch is already
    closed is read with `oss_block {thin: true}`, unless the command is a
    `--from-height` rescan. The current epoch, and everything below the
@@ -403,7 +410,7 @@ long absence is fast.
       its creation. A published one tells the OSS which transaction spent the
       note, so a spend made elsewhere (a restored wallet, a second copy) is
       linked to this wallet.
-    - The run of `oss_block` heights shows where the wallet's history starts
+    - The run of `oss_blocks` heights shows where the wallet's history starts
       and when it is online.
     - Receipts' blocks come from the node, which learns them (as before).
   - Devtool prints a `privacy warning:` line on stderr for every OSS request

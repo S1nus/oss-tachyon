@@ -172,6 +172,25 @@ pub struct BlockParams {
     pub thin: bool,
 }
 
+/// Most blocks one `oss_blocks` call asks for.
+pub const MAX_BLOCKS: u32 = 100;
+
+/// `oss_blocks` params: blocks `from..from + count`, 1 ≤ count ≤
+/// [`MAX_BLOCKS`], each as `oss_block` serves it. The OSS answers with fewer
+/// at its archive tip or past a byte budget; `from` itself must be archived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct BlocksParams {
+    pub from: u32,
+    pub count: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub thin: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BlocksResult {
+    pub blocks: Vec<TachyonBlock>,
+}
+
 /// Most values one `oss_tachygrams` call looks up.
 pub const MAX_TACHYGRAM_VALUES: usize = 64;
 
@@ -644,6 +663,8 @@ mod tests {
             }
         );
         assert!(round_trip::<BlockParams>(json!({"height": 7, "thin": true}))?.thin);
+        assert!(!round_trip::<BlocksParams>(json!({"from": 7, "count": 2}))?.thin);
+        round_trip::<BlocksResult>(json!({"blocks": []}))?;
         round_trip::<TachygramsParams>(json!({"values": [H]}))?;
         round_trip::<TachygramsResult>(json!({"heights": [7, null]}))?;
 

@@ -300,6 +300,29 @@ async fn thin_blocks_keep_the_anchor_chain_and_lookups_find_published_values() -
     oss_core::chain::validate_thin(&thin, Some(previous), 8)?;
     assert!(oss_core::chain::validate(&thin, Some(previous), 8).is_err());
 
+    // A range serves each block as `oss_block` does, and stops at the tip.
+    let range = |from: u32, count: u32| json!({"from": from, "count": count, "thin": true});
+    let page: oss_core::BlocksResult = call(url, "oss_blocks", range(height - 1, 100)).await?;
+    let heights: Vec<u32> = page.blocks.iter().map(|b| b.height).collect();
+    assert_eq!(heights, (height - 1..height + 99).collect::<Vec<_>>());
+    assert_eq!(
+        serde_json::to_value(&page.blocks[1])?,
+        serde_json::to_value(&thin)?
+    );
+    let tip = closed.blocks.last().unwrap().height;
+    let end: oss_core::BlocksResult = call(url, "oss_blocks", range(tip - 1, 100)).await?;
+    assert_eq!(end.blocks.len(), 2);
+    assert_eq!(
+        code(url, "oss_blocks", range(tip + 1, 1)).await?,
+        Unavailable.code()
+    );
+    for count in [0, 101] {
+        assert_eq!(
+            code(url, "oss_blocks", range(height, count)).await?,
+            InvalidParams.code()
+        );
+    }
+
     let unknown = nullifiers(3)[2];
     let values =
         json!({"values": [hex32(closed.spent[0]), hex32(unknown), hex32(closed.spent[1])]});
