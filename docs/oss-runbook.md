@@ -8,8 +8,8 @@ publishes code or changes the box needs the operator.
 | Repo | Branch | Head | Notes |
 | --- | --- | --- | --- |
 | S1nus/oss-tachyon (`oss/`) | `main` | see `git log` | `tachyon-oss` binary, `oss-core` library |
-| cnode-agent/zcash-devtool | `c/oss-client` | `90861cf` | 11 commits on `1716bff`; takes `oss-core` from S1nus/oss-tachyon at `42a3859`, and needs an OSS with `oss_blocks`: upgrade the OSS first |
-| cnode-agent/tachyon-workload | `oss` | `c63d739` | `oss_url` is **required**; `DEVTOOL_REVISION` is `90861cf` |
+| cnode-agent/zcash-devtool | `c/oss-client` | `aa2909e` | 12 commits on `1716bff`; takes `oss-core` from S1nus/oss-tachyon at `467da1f`, and needs an OSS with 1000-block `oss_blocks` and `oss_transactions`: upgrade the OSS first |
+| cnode-agent/tachyon-workload | `oss` | `625f428` | `oss_url` is **required**; `DEVTOOL_REVISION` is `aa2909e` |
 | cnode-agent/tachyon-faucet | `oss` | `2a18150` | `oss_url` is optional |
 
 Zakura, tachyon, ragu, common and tachyscan are unchanged.
