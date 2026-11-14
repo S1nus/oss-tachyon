@@ -25,6 +25,15 @@ Status: design for handoff, 2026-11-11. The companion task list is
 - Revision 6 adds `oss_blocks` (§4.2): remote sync reads pages of up to 100
   blocks, and checks each page against the node in one `getblock` batch,
   instead of three round trips per block.
+- Revision 7 removes devtool's `getblock` calls, whose size grows with every
+  transaction in a block:
+  - Pages grow to 1000 blocks, checked with one `getblockhash` batch, and are
+    fetched one page ahead of validation.
+  - The wallet asks about its own transactions by ID (`getrawtransaction`),
+    and the OSS indexes every transaction ID for those a pruned node has
+    forgotten (`oss_transactions`).
+  - Coinbase maturity comes from `gettxout`.
+  - Thin sync no longer skips a note's spend check after a rewind.
 
 Normative sources: the Tachyon book in `repos/tachyon/book/src/` (`proof-tree.md`
 §Roles, `nullifiers.md` §Delegation, `anchor.md`, `tachygrams.md`) and the code at
@@ -108,6 +117,7 @@ JSON-RPC methods the node already has, so **no Zakura change is required.**
 | `getblockchaininfo`, `getblockhash 0` | startup: network identity and node tip |
 | `getbestblockhash` (polled every 1 s) | tip-change detection |
 | `getblockhash h` | reorg walk-back |
+| `getblock <hash> 1` | the block's transaction IDs, for the transaction index (§2.3). Zakura keeps them after pruning a body |
 | `gettachyonblock h` | **the data feed**. Returns hash, previous hash, height, `poolHeight`, `epoch`, `epochLength`, `finalized`, `anchorBefore`, `epochStartAnchor`, `anchorAfter`, and `stamps[{transactionIndex, txid, tachygramSet, tachygrams[]}]` |
 
 `gettachyonblock` is the right feed because Zakura already parses the v7
@@ -157,7 +167,7 @@ and the mempool.
 | Data | Zakura node | OSS |
 | --- | --- | --- |
 | Raw blocks and transaction bytes | **Owner.** Archive mode keeps all; pruned mode keeps ≥ `tx_retention` blocks | Never stores raw bytes |
-| Headers, `height ↔ hash`, `txid → location` | **Owner**, kept forever | Keeps `hash`/`prev`/`height` of ingested Tachyon-era blocks for reorg detection, and txids of stamp-bearing transactions only |
+| Headers, `height ↔ hash`, `txid → location` | **Owner**, kept forever, but `getrawtransaction` cannot serve a pruned body | Keeps `hash`/`prev`/`height` of ingested Tachyon-era blocks for reorg detection, and every transaction ID with its height (`transactions`), so `oss_transactions` answers for pruned blocks. `meta.txindex_through` records how far it reaches; an archive from before revision 7 is indexed on the next start |
 | Two-epoch tachygram set and anchor validity set (consensus) | **Owner** | — |
 | Per-block Tachyon projection: anchors before/entry/after, stamps, tachygram-set commitments, tachygrams | Implicit in raw bytes; lost when pruned | **Owner (archive).** The verbatim `gettachyonblock` JSON per canonical block, from the OSS's start height onward |
 | Tachygram value → (height, stamp) index | Two-epoch window only | **Owner**, full history. Used for the `Spent` check and creation lookup |
@@ -287,7 +297,8 @@ All methods are stateless. Results for closed epochs can be cached.
 | --- | --- | --- |
 | `oss_info` | `{}` | `{genesisHash, activationHeight, epochLength, proofSystem:{tachyon,ragu,mock}, tip:{height,hash,epoch,anchor,entryAnchor}, archiveFromHeight, evidenceReadyThrough:int\|null, node:{height,lagBlocks}}` |
 | `oss_block` | `{height, thin?}` | The stored `gettachyonblock` JSON for that canonical block, served from the raw stored text. `finalized` is recomputed as true when the block is at least 1000 blocks below the tip. It works for heights the node has pruned. Devtool's `chain::Block` already deserializes it. With `thin: true`, every stamp's `tachygrams` is empty; `tachygramSet` still folds into the anchors (`chain::validate_thin`). |
-| `oss_blocks` | `{from, count, thin?}`, 1 ≤ count ≤ 100 | `{blocks:[…]}`: blocks `from..from+count` as `oss_block` serves them, read in one snapshot. Fewer at the archive tip or past 16 MiB of stored JSON; `from` must be archived (else `Unavailable`). |
+| `oss_blocks` | `{from, count, thin?}`, 1 ≤ count ≤ 1000 (Zakura's batch limit, so a page's hashes fit one node batch) | `{blocks:[…]}`: blocks `from..from+count` as `oss_block` serves them, read in one snapshot. Fewer at the archive tip or past 16 MiB of stored JSON; `from` must be archived (else `Unavailable`). |
+| `oss_transactions` | `{txids:[hex…]}`, 1 ≤ n ≤ 64 | `{heights:[int\|null…]}`: the archived height that mined each transaction. `NotReady` while the index is behind the archive tip, so null means "not mined in the archive". For a wallet's own transactions that a pruned node has forgotten |
 | `oss_tachygrams` | `{values:[hex…]}`, 1 ≤ n ≤ 64 | `{heights:[int\|null…]}`: the lowest archived height that publishes each value. Thin sync's spend check; the lookup PIR would replace. |
 | `oss_epoch` | `{epoch}` | `{epoch, closingHash\|null, evidence:{status:"open"\|"building"\|"ready", discriminant?, profiles?:[{depth,bits,members}]}}`. `discriminant` and `profiles` appear only when `ready`. |
 | `oss_bucket` | `{epoch, profile:{depth,bits}}` | `{pcd}`: the sealed `QrBucket` PCD of that profile |
@@ -347,10 +358,23 @@ give different targets, and the payment would fail to prove.
 2. Sync up to the lower of the two tips. If the OSS tip is lower, report
    `caught_up: false`.
 3. Read heights from `archiveFromHeight` up to the OSS tip with
-   `oss_blocks`, a page of up to 100 at a time. One JSON-RPC batch of
-   `getblock <height> 1` to the node checks each block's hash and gives its
-   transaction list. Read any lower heights from the node's
-   `gettachyonblock`, one block per request.
+   `oss_blocks`, a page of up to 1000 at a time. One JSON-RPC batch of
+   `getblockhash` to the node, sent at the same time, checks each block's
+   hash. A fetch thread gets the next page while the main thread validates
+   and stores the current one. `sync-many` wallets share fetched pages.
+   Read any lower heights from the node's `gettachyonblock` and
+   `getblockhash`, one block per request. Devtool never calls `getblock`:
+   - **Own transactions.** At the end of a sync, one `getrawtransaction
+     <txid> 1` batch covers every pending send that blocks from this sync
+     could hold. Mined ones are recorded with their height. A pruned node
+     answers "not found" for those below its `pruneheight`; then
+     `oss_transactions` answers.
+   - **Receipts.** A receipt's height hint is checked against the node's
+     hash at that height and its stored block hash; a stale hint downloads
+     nothing. Otherwise `getrawtransaction` gives the height, or
+     `oss_transactions` on a pruned node. The block comes from the node, or
+     the OSS if the node pruned it, and must hold the note commitment.
+   - **Coinbase maturity** of transparent funds comes from `gettxout`.
 4. **Thin sync.** A height inside the OSS archive whose epoch is already
    closed is read with `oss_block {thin: true}`, unless the command is a
    `--from-height` rescan. The current epoch, and everything below the
@@ -385,7 +409,11 @@ long absence is fast.
   only withhold service, or claim `Spent` falsely; the wallet can check a
   `Spent` claim in its own synced tachygram index, or, for an epoch synced
   thin, in that block fetched in full. Wrong anchors cannot produce
-  a spend that consensus accepts.
+  a spend that consensus accepts. Since revision 7 the wallet no longer
+  checks that each stamp sits at the node's transaction position, and it
+  takes an `oss_transactions` answer on the OSS's word. That answer only sets
+  the status a send shows, not which funds can be spent: spends are found
+  by nullifier, and reservations end at the expiry height.
 - **The key property of the retroactive model.** Consensus publishes `nf_e`
   only in epoch `e` (as the current nullifier) or in `e−1` (as the next one).
   `oss_unspent` accepts only closed epochs and answers `Spent` if a value is
@@ -413,8 +441,15 @@ long absence is fast.
     - The run of `oss_blocks` heights shows where the wallet's history starts
       and when it is online.
     - Receipts' blocks come from the node, which learns them (as before).
-  - Devtool prints a `privacy warning:` line on stderr for every OSS request
-    that carries wallet-specific values. `-v` logs every OSS request and its
+  - **Revision 7** adds `oss_transactions`. It is asked only when a pruned
+    node cannot answer: about a wallet's own send, or a payment it received.
+    Each ID asked is linked to the wallet.
+  - Devtool prints a `privacy warning:` line on stderr for every request
+    that carries wallet-specific values to a remote service: every OSS one,
+    and node lookups of a received payment's transaction or block (skipped
+    when the node URL is a loopback address). Lookups of the wallet's own
+    sends, and `gettxout` for its funding outputs, warn nothing: the node
+    already has them from this wallet. `-v` logs every OSS request and its
     response time.
 
   Future mitigations: Tor, requesting the bucket and the segments in separate

@@ -189,6 +189,21 @@ impl NodeData {
                         .ok_or((-8, "the requested block is not in the best chain"))
                 }
             }
+            // Zakura keeps transaction IDs after pruning a body.
+            "getblock" => self
+                .blocks
+                .iter()
+                .find(|b| params[0] == b.hash.as_str())
+                .map(|b| {
+                    let stamped = b.stamps.iter().map(|s| s.txid.clone()).collect();
+                    let tx: Vec<String> = if b.transactions.is_empty() {
+                        stamped
+                    } else {
+                        b.transactions.clone()
+                    };
+                    json!({"hash": b.hash, "height": b.height, "tx": tx})
+                })
+                .ok_or((-8, "Block not found")),
             _ => Err((-32601, "Method not found")),
         };
         match result {

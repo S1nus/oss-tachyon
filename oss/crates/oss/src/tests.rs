@@ -316,7 +316,7 @@ async fn thin_blocks_keep_the_anchor_chain_and_lookups_find_published_values() -
         code(url, "oss_blocks", range(tip + 1, 1)).await?,
         Unavailable.code()
     );
-    for count in [0, 101] {
+    for count in [0, 1001] {
         assert_eq!(
             code(url, "oss_blocks", range(height, count)).await?,
             InvalidParams.code()
@@ -339,6 +339,33 @@ async fn thin_blocks_keep_the_anchor_chain_and_lookups_find_published_values() -
             InvalidParams.code()
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn transactions_are_found_once_the_index_reaches_the_tip() -> Result<()> {
+    let closed = Closed::new().await?;
+    let (url, height) = (&closed.url, closed.spend_height);
+    let unknown = "ab".repeat(32);
+    let ids = json!({"txids": [format!("{height:064x}"), unknown]});
+    let found: oss_core::TransactionsResult = call(url, "oss_transactions", ids.clone()).await?;
+    assert_eq!(found.heights, vec![Some(height), None]);
+    for bad in [
+        json!({"txids": []}),
+        json!({"txids": vec![unknown.clone(); 65]}),
+        json!({"txids": ["abc"]}),
+    ] {
+        assert_eq!(
+            code(url, "oss_transactions", bad).await?,
+            InvalidParams.code()
+        );
+    }
+    // Behind the archive tip, a miss could be an unindexed block.
+    store::open(&closed.db.0)?.execute(
+        "UPDATE meta SET value = '1' WHERE key = 'txindex_through'",
+        [],
+    )?;
+    assert_eq!(code(url, "oss_transactions", ids).await?, NotReady.code());
     Ok(())
 }
 

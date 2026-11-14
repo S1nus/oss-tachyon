@@ -154,6 +154,14 @@ impl Node {
         self.call("getblockhash", json!([height])).await
     }
 
+    /// `getblock <hash> 1`: the block's transaction IDs, which Zakura keeps
+    /// after pruning its body.
+    pub async fn transactions(&self, hash: &str) -> Result<Vec<String>> {
+        let block: Value = self.call("getblock", json!([hash, 1])).await?;
+        ensure!(block["hash"] == hash, "getblock identity mismatch");
+        Ok(serde_json::from_value(block["tx"].clone())?)
+    }
+
     /// `gettachyonblock`: the verbatim result text, and its parse.
     pub async fn tachyon_block(&self, height: u32) -> Result<(String, TachyonBlock)> {
         let raw: Box<RawValue> = self
@@ -273,6 +281,7 @@ impl Follower {
     pub async fn sync(&mut self) -> Result<()> {
         let node_tip = self.node.height().await?;
         let mut parent = self.reconcile(node_tip).await?;
+        self.index_archived().await?;
         loop {
             let height = parent.as_ref().map_or(self.start, |p| p.height + 1);
             if height > node_tip {
@@ -292,7 +301,8 @@ impl Follower {
                 Some(p) => chain::validate(&block, Some(p), self.activation)?,
                 None => chain::validate_checkpoint(&block, self.activation)?,
             }
-            self.commit(&json, &block)?;
+            let txids = self.transactions(&block.hash).await?;
+            self.commit(&json, &block, &txids)?;
             parent = Some(block);
         }
     }
@@ -312,6 +322,49 @@ impl Follower {
             }
             result => result,
         }
+    }
+
+    /// The block's transaction IDs, from the backfill node if the node fails.
+    // `&mut` for the same reason as `fetch`.
+    async fn transactions(&mut self, hash: &str) -> Result<Vec<String>> {
+        match (self.node.transactions(hash).await, &self.backfill) {
+            (Err(e), Some(backfill)) if e.is::<RpcError>() => backfill.transactions(hash).await,
+            (result, _) => result,
+        }
+    }
+
+    /// Indexes the transactions of blocks archived before the index existed
+    /// (design revision 7), oldest first, so `oss_transactions` can answer.
+    async fn index_archived(&mut self) -> Result<()> {
+        let (Some(first), Some(tip)) = (
+            archive::first_height(&self.conn)?,
+            archive::tip(&self.conn)?,
+        ) else {
+            return Ok(());
+        };
+        let mut next = store::meta::<u32>(&self.conn, TXINDEX)?.map_or(first, |h| h + 1);
+        if next <= tip.height {
+            eprintln!(
+                "follower: indexing the transactions of blocks {next}–{}",
+                tip.height
+            );
+        }
+        while next <= tip.height {
+            let end = tip.height.min(next + 499);
+            let mut rows = Vec::new();
+            for height in next..=end {
+                let hash = archive::hash(&self.conn, height)?
+                    .context("archived heights are contiguous")?;
+                rows.push((height, self.transactions(&hash).await?));
+            }
+            let tx = self.conn.transaction()?;
+            for (height, txids) in &rows {
+                index_transactions(&tx, *height, txids)?;
+            }
+            tx.commit()?;
+            next = end + 1;
+        }
+        Ok(())
     }
 
     /// Walks back from the archive tip to the newest block still on the node's
@@ -334,6 +387,11 @@ impl Follower {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM tachygrams WHERE height >= ?1", [fork])?;
         tx.execute("DELETE FROM blocks WHERE height >= ?1", [fork])?;
+        tx.execute("DELETE FROM transactions WHERE height >= ?1", [fork])?;
+        tx.execute(
+            "UPDATE meta SET value = ?1 WHERE key = ?2 AND CAST(value AS INTEGER) >= ?3",
+            params![fork.saturating_sub(1), TXINDEX, fork],
+        )?;
         tx.execute(
             "INSERT INTO meta(key, value) VALUES ('rewind_from', ?1)
              ON CONFLICT(key) DO UPDATE SET value = MIN(CAST(value AS INTEGER), ?1)",
@@ -345,7 +403,7 @@ impl Follower {
         Ok(tip)
     }
 
-    fn commit(&mut self, json: &str, block: &TachyonBlock) -> Result<()> {
+    fn commit(&mut self, json: &str, block: &TachyonBlock, txids: &[String]) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO blocks(height, hash, prev_hash, epoch, json) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -366,10 +424,28 @@ impl Follower {
                 }
             }
         }
+        index_transactions(&tx, block.height, txids)?;
         tx.commit()?;
         self.tip.send_replace(block.height);
         Ok(())
     }
+}
+
+/// The `meta` key of the highest height whose transactions are indexed.
+pub const TXINDEX: &str = "txindex_through";
+
+/// Records `txids` as mined at `height`, which the index then covers.
+fn index_transactions(tx: &rusqlite::Transaction, height: u32, txids: &[String]) -> Result<()> {
+    let mut insert =
+        tx.prepare("INSERT OR REPLACE INTO transactions(txid, height) VALUES (?1, ?2)")?;
+    for txid in txids {
+        insert.execute(params![bytes32(txid)?, height])?;
+    }
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2",
+        params![TXINDEX, height],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -416,6 +492,37 @@ mod tests {
             indexed,
             published.map(|s| s.tachygrams.len()).sum::<usize>()
         );
+        // The transaction index: exactly those blocks' IDs, through the tip.
+        let txids: std::collections::BTreeSet<_> = expected
+            .iter()
+            .flat_map(|b| &b.stamps)
+            .map(|s| &s.txid)
+            .collect();
+        let rows: usize = conn.query_row("SELECT COUNT(*) FROM transactions", [], |r| r.get(0))?;
+        assert_eq!(rows, txids.len());
+        assert_eq!(
+            store::meta::<u32>(conn, TXINDEX)?,
+            expected.last().map(|b| b.height)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn indexes_the_transactions_of_blocks_archived_before_the_index() -> Result<()> {
+        let mut blocks = vec![genesis()];
+        populate_epoch(&mut blocks, 3)?;
+        mine(&mut blocks)?;
+        populate_epoch(&mut blocks, 2)?;
+        let node = FakeNode::start(blocks.clone())?;
+        let db = TempDb::new();
+        follower(&db, &node, None, None).await?.sync().await?;
+        // An archive from before design revision 7: no rows, no marker.
+        let conn = store::open(&db.0)?;
+        conn.execute_batch(
+            "DELETE FROM transactions; DELETE FROM meta WHERE key = 'txindex_through';",
+        )?;
+        follower(&db, &node, None, None).await?.sync().await?;
+        assert_mirrors(&conn, &node, blocks[0].height)?;
         Ok(())
     }
 

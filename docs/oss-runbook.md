@@ -126,9 +126,16 @@ Zakura, tachyon, ragu, common and tachyscan are unchanged.
   32 MiB per full epoch per reorg.
 - **Thin sync:** a wallet that synced epochs thin needs the OSS to check
   spends in them, and cannot prove them locally.
-- **Sync speed:** remote sync reads 100 blocks per `oss_blocks` request and
-  one node `getblock` batch. Local mode, and heights below the OSS archive,
-  still fetch one block per request.
+- **Sync speed:** remote sync reads pages of 1000 blocks (one `oss_blocks`
+  call and one node `getblockhash` batch, sent together), one page ahead of
+  validation. Devtool never calls `getblock`. Local mode, and heights below
+  the OSS archive, still fetch one block per request.
+- **Upgrading to revision 7:**
+  - Upgrade the OSS before devtool. A new devtool asks for 1000-block pages,
+    which an older OSS rejects.
+  - On its first start, the OSS indexes the transaction IDs of every block it
+    already archived: one `getblock` per block to its node. Until that
+    finishes, `oss_transactions` answers `NotReady`; nothing else waits.
 - **Privacy:** see design §4.4. The OSS sees the nullifier runs and the
   creation-bucket requests of remote wallets. Spends of notes created in the
   current epoch prove their anchor spans locally, so the OSS is not told which

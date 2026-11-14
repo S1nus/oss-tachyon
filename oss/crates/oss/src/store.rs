@@ -14,6 +14,9 @@ CREATE INDEX IF NOT EXISTS blocks_by_epoch ON blocks(epoch);
 CREATE TABLE IF NOT EXISTS tachygrams(tg BLOB NOT NULL, height INTEGER NOT NULL,
   stamp INTEGER NOT NULL, PRIMARY KEY(tg, height));
 CREATE INDEX IF NOT EXISTS tachygrams_by_height ON tachygrams(height);
+-- Every archived transaction ID (RPC hex, decoded) and the height that mined it.
+CREATE TABLE IF NOT EXISTS transactions(txid BLOB PRIMARY KEY, height INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS transactions_by_height ON transactions(height);
 CREATE TABLE IF NOT EXISTS epochs(epoch INTEGER PRIMARY KEY, discriminant BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS evidence(epoch INTEGER NOT NULL, closing_hash TEXT NOT NULL,
   profiles TEXT NOT NULL, PRIMARY KEY(epoch, closing_hash));

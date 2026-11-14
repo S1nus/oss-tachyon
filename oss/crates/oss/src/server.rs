@@ -27,10 +27,11 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use oss_core::{
     AnchorSpansResult, BlockParams, BlocksParams, BucketParams, BucketProfile, BucketResult,
     EpochEvidence, EpochParams, EpochResult, ErrorCode, EvidenceStatus, InfoResult, MAX_BLOCKS,
-    MAX_SPAN_FROMS, MAX_TACHYGRAM_VALUES, NodeStatus, NotReadyData, ProofSystem, SpentData,
-    TachygramsResult, Tip, anchor, anchor_hex, pcd_to_hex,
+    MAX_SPAN_FROMS, MAX_TACHYGRAM_VALUES, MAX_TRANSACTION_IDS, NodeStatus, NotReadyData,
+    ProofSystem, SpentData, TachygramsResult, Tip, TransactionsParams, TransactionsResult, anchor,
+    anchor_hex, bytes32, pcd_to_hex,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, sync::Semaphore, task::JoinHandle};
@@ -42,7 +43,7 @@ use crate::{
     archive, builder,
     config::Config,
     epochs,
-    follower::{Follower, Node},
+    follower::{Follower, Node, TXINDEX},
     span_store, store, unspent_service,
 };
 
@@ -228,6 +229,13 @@ async fn call(shared: &Shared, method: &str, params: Value) -> Result<Value> {
             let params: oss_core::TachygramsParams = parse(params)?;
             read(shared, move |conn| json(tachygrams(conn, &params.values)?)).await
         }
+        // privacy: a wallet asks only about its own transactions (sends whose
+        // node pruned them, payments it received), so each ID is linked to
+        // it. PIR would hide them.
+        "oss_transactions" => {
+            let params: TransactionsParams = parse(params)?;
+            read(shared, move |conn| json(transactions(conn, &params.txids)?)).await
+        }
         // privacy: one note's nullifier run (linkable, and its length dates
         // the note); `Spent` names the spending transaction.
         "oss_unspent" => {
@@ -357,6 +365,38 @@ fn tachygrams(conn: &Connection, values: &[String]) -> Result<TachygramsResult> 
         .map(|v| hits.iter().find(|(hit, ..)| hit == v).map(|&(_, h, _)| h))
         .collect();
     Ok(TachygramsResult { heights })
+}
+
+/// The archived height that mined each transaction. Waits for the follower to
+/// index every archived block, so a miss means "not mined in the archive".
+fn transactions(conn: &Connection, txids: &[String]) -> Result<TransactionsResult> {
+    if !(1..=MAX_TRANSACTION_IDS).contains(&txids.len()) {
+        bail!(Failure::InvalidParams(format!(
+            "expected 1 to {MAX_TRANSACTION_IDS} transaction IDs, got {}",
+            txids.len()
+        )));
+    }
+    let keys = txids
+        .iter()
+        .enumerate()
+        .map(|(i, hex)| {
+            bytes32(hex)
+                .map_err(|_| Failure::InvalidParams(format!("txids[{i}] is not 32 bytes of hex")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let tx = conn.unchecked_transaction()?;
+    let tip = archive::tip(&tx)?.map(|b| b.height);
+    if tip.is_none() || store::meta::<u32>(&tx, TXINDEX)? != tip {
+        bail!(Failure::NotReady(
+            "the transaction index is catching up with the archive".into()
+        ));
+    }
+    let mut lookup = tx.prepare("SELECT height FROM transactions WHERE txid = ?1")?;
+    let heights = keys
+        .iter()
+        .map(|key| lookup.query_row([key], |r| r.get(0)).optional())
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(TransactionsResult { heights })
 }
 
 fn epoch(conn: &Connection, epoch: u32) -> Result<EpochResult> {

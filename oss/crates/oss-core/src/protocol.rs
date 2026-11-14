@@ -172,8 +172,9 @@ pub struct BlockParams {
     pub thin: bool,
 }
 
-/// Most blocks one `oss_blocks` call asks for.
-pub const MAX_BLOCKS: u32 = 100;
+/// Most blocks one `oss_blocks` call asks for: Zakura's JSON-RPC batch limit,
+/// so a page's hashes fit one node batch.
+pub const MAX_BLOCKS: u32 = 1000;
 
 /// `oss_blocks` params: blocks `from..from + count`, 1 ≤ count ≤
 /// [`MAX_BLOCKS`], each as `oss_block` serves it. The OSS answers with fewer
@@ -189,6 +190,22 @@ pub struct BlocksParams {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BlocksResult {
     pub blocks: Vec<TachyonBlock>,
+}
+
+/// Most transaction IDs one `oss_transactions` call looks up.
+pub const MAX_TRANSACTION_IDS: usize = 64;
+
+/// `oss_transactions` params: 1 ≤ n ≤ [`MAX_TRANSACTION_IDS`] transaction IDs,
+/// in RPC (display) hex.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TransactionsParams {
+    pub txids: Vec<String>,
+}
+
+/// The archived height that mined each transaction, if any.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TransactionsResult {
+    pub heights: Vec<Option<u32>>,
 }
 
 /// Most values one `oss_tachygrams` call looks up.
@@ -666,6 +683,8 @@ mod tests {
         assert!(!round_trip::<BlocksParams>(json!({"from": 7, "count": 2}))?.thin);
         round_trip::<BlocksResult>(json!({"blocks": []}))?;
         round_trip::<TachygramsParams>(json!({"values": [H]}))?;
+        round_trip::<TransactionsParams>(json!({"txids": [H]}))?;
+        round_trip::<TransactionsResult>(json!({"heights": [7, null]}))?;
         round_trip::<TachygramsResult>(json!({"heights": [7, null]}))?;
 
         round_trip::<EpochParams>(json!({"epoch": 3}))?;
