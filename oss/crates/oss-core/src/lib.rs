@@ -7,7 +7,7 @@ pub mod protocol;
 pub mod spans;
 pub mod unspent;
 
-pub use evidence::build_epoch;
+pub use evidence::{ChunkBuilder, Intake, LeafBuilder, build_epoch};
 pub use protocol::*;
 pub use spans::{SpanBuilder, SpanChunk, Spans};
 pub use unspent::prove_unspent;

@@ -13,6 +13,7 @@ use ragu_core::{
 };
 use ragu_primitives::allocator::Allocator;
 use serde::{Deserialize, Serialize};
+use udon::field::Field;
 use zcash_tachyon::{
     Anchor, EpochIndex, QrClassRoot, QrDiscriminant, QrProfile, Tachygram, TachygramSetCommit,
     pasta::Fp,
@@ -396,6 +397,32 @@ impl WireHeader for qr::QrBucket {
     fn decode(elements: &[Fp]) -> Option<Self::Data> {
         <Self as ragu::WireHeader<Fp>>::decode(elements)
     }
+}
+
+impl WireHeader for qr::QrIntake {
+    /// For local chunk persistence only: intake headers stay unpublished until
+    /// the epoch is sealed, and the OSS stores them without ever serving them.
+    fn decode(elements: &[Fp]) -> Option<Self::Data> {
+        let [epoch, start, end, discriminant, depth, bits] =
+            <[Fp; 6]>::try_from(elements).ok()?;
+        Some((
+            EpochIndex::try_from(epoch).ok()?,
+            Anchor(start),
+            Anchor(end),
+            QrDiscriminant(discriminant),
+            QrProfile {
+                depth: small(depth)?,
+                bits: small(bits)?,
+            },
+        ))
+    }
+}
+
+/// A canonical non-negative `u32` encoded as a field element.
+fn small(value: Fp) -> Option<u32> {
+    let [a, b, c, d, ..] = value.to_bytes();
+    let number = u32::from_le_bytes([a, b, c, d]);
+    (value == Fp::from(u64::from(number))).then_some(number)
 }
 
 impl WireHeader for pool::AnchorSpan {
