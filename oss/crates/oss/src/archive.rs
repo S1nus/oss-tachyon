@@ -64,6 +64,18 @@ pub fn epoch_blocks(conn: &Connection, epoch: u32) -> Result<Vec<TachyonBlock>> 
     rows.map(|json| Ok(serde_json::from_str(&json?)?)).collect()
 }
 
+/// The epoch's first archived block.
+pub fn first_block(conn: &Connection, epoch: u32) -> Result<Option<TachyonBlock>> {
+    parse(
+        conn.query_row(
+            "SELECT json FROM blocks WHERE epoch = ?1 ORDER BY height LIMIT 1",
+            [epoch],
+            |r| r.get(0),
+        )
+        .optional()?,
+    )
+}
+
 /// The hash of the epoch's last block, once the next epoch's first block is
 /// archived (the epoch has closed).
 pub fn closing_hash(conn: &Connection, epoch: u32) -> Result<Option<String>> {

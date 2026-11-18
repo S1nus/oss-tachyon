@@ -3,6 +3,7 @@
 pub mod archive;
 pub mod builder;
 pub mod config;
+pub mod epoch_chunks;
 pub mod epochs;
 pub mod follower;
 pub mod server;

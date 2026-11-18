@@ -11,13 +11,12 @@ use zcash_tachyon::{
     witness,
 };
 
-use crate::{Pcd, TachyonBlock, anchor, max_polynomial_members, profiles, trivial};
+use crate::{Pcd, TachyonBlock, anchor, max_polynomial_members, trivial};
 
-/// Seals every `QrBucket` of a closed epoch: one per routing leaf of
-/// [`profiles`], empty siblings included. `blocks` are the epoch's blocks plus
-/// the next epoch's first block; `predecessor` is the final anchor of the
-/// previous epoch (zero for epoch 0). Returns each profile, its bucket and its
-/// member count.
+/// Seals every `QrBucket` of a closed epoch: one per leaf of the routing tree,
+/// empty siblings included. `blocks` are the epoch's blocks plus the next
+/// epoch's first block; `predecessor` is the final anchor of the previous epoch
+/// (zero for epoch 0). Returns each profile, its bucket and its member count.
 pub fn build_epoch(
     blocks: &[TachyonBlock],
     predecessor: Anchor,
@@ -25,40 +24,33 @@ pub fn build_epoch(
 ) -> Result<Vec<(QrProfile, Pcd<qr::QrBucket>, usize)>> {
     let epoch = Epoch::read(blocks)?;
     let chunks = epoch.chunks(r0)?;
-    profiles(epoch.members.clone(), r0)?
-        .into_iter()
-        .map(|path| {
-            let profile = path.iter().fold(QrProfile::ROOT, |p, &b| p.descend(b));
-            let (bucket, members) = epoch.build(&path, &chunks, predecessor, r0)?;
-            ensure!(
-                bucket.data().0 == EpochIndex::new(epoch.epoch)
-                    && bucket.data().1 == epoch.start
-                    && bucket.data().3 == r0
-                    && bucket.data().4 == profile,
-                "sealed bucket does not match its epoch and profile"
-            );
-            Ok((profile, bucket, members))
-        })
-        .collect()
+    let mut buckets = Vec::new();
+    epoch.seal_node(&[], chunks, predecessor, r0, &mut buckets)?;
+    Ok(buckets)
 }
 
 #[derive(Clone)]
-struct Intake {
-    proof: Pcd<qr::QrIntake>,
-    members: Vec<Tachygram>,
+pub struct Intake {
+    pub proof: Pcd<qr::QrIntake>,
+    pub members: Vec<Tachygram>,
 }
 
 impl Intake {
-    fn route(mut self, path: &[bool], discriminant: QrDiscriminant) -> Result<Self> {
-        for &side in path {
-            let depth = self.proof.data().4.depth;
-            let (sides, ()) = PROOF_SYSTEM.fuse(
-                &mut rand::rng(),
-                qr::QrIntakeSplit,
-                witness::qr_intake_split((*self.proof.data(), ()), &self.members),
-                self.proof,
-                trivial(),
-            )?;
+    /// Splits the intake once at its current depth into its false and true
+    /// sides. Both sides share the split proof, so a tree walk pays one split
+    /// per node instead of one per path.
+    fn split(self, discriminant: QrDiscriminant) -> Result<(Self, Self)> {
+        let depth = self.proof.data().4.depth;
+        let (sides, ()) = PROOF_SYSTEM.fuse(
+            &mut rand::rng(),
+            qr::QrIntakeSplit,
+            witness::qr_intake_split((*self.proof.data(), ()), &self.members),
+            self.proof,
+            trivial(),
+        )?;
+        let shift = discriminant.at(depth);
+        let mut out = Vec::with_capacity(2);
+        for side in [false, true] {
             let (selection, ()) = PROOF_SYSTEM.fuse(
                 &mut rand::rng(),
                 qr::QrSideSelect,
@@ -66,20 +58,26 @@ impl Intake {
                 sides.clone(),
                 trivial(),
             )?;
-            self.proof = PROOF_SYSTEM
+            let proof = PROOF_SYSTEM
                 .fuse(
                     &mut rand::rng(),
                     qr::QrSideDescend,
                     witness::qr_side_descend((*sides.data(), *selection.data()), side),
-                    sides,
+                    sides.clone(),
                     selection,
                 )?
                 .0;
-            let shift = discriminant.at(depth);
-            self.members
-                .retain(|member| QrClassRoot::of((*member).into(), shift).0 == side);
+            let members = self
+                .members
+                .iter()
+                .copied()
+                .filter(|member| QrClassRoot::of((*member).into(), shift).0 == side)
+                .collect();
+            out.push(Self { proof, members });
         }
-        Ok(self)
+        let right = out.pop().expect("two sides");
+        let left = out.pop().expect("two sides");
+        Ok((left, right))
     }
 
     fn merge(mut self, right: Self) -> Result<Self> {
@@ -105,10 +103,294 @@ impl Intake {
     }
 }
 
+/// Accumulates an epoch's stamp intakes block by block, merging them into
+/// capacity-sized chunks exactly as `Epoch::chunks` would. Persist the chunks
+/// and `resume` after a restart; `seal` then only routes them, so the work at
+/// the epoch boundary does not grow with the epoch's length.
+///
+/// This is also the fallback that keeps the seal at the minimal bucket depth:
+/// if an epoch outgrows the depth predicted for any future leaf accumulation,
+/// its chunks are re-routed in full rather than sealed shallow.
+pub struct ChunkBuilder {
+    epoch: u32,
+    discriminant: QrDiscriminant,
+    capacity: usize,
+    chunks: Vec<Intake>,
+}
+
+impl ChunkBuilder {
+    pub fn new(epoch: u32, discriminant: QrDiscriminant, capacity: usize) -> Self {
+        Self {
+            epoch,
+            discriminant,
+            capacity,
+            chunks: Vec::new(),
+        }
+    }
+
+    /// Continues a persisted epoch. Chunks must be contiguous, pre-routing and
+    /// within one polynomial each.
+    pub fn resume(
+        epoch: u32,
+        discriminant: QrDiscriminant,
+        capacity: usize,
+        chunks: Vec<Intake>,
+    ) -> Result<Self> {
+        for (index, chunk) in chunks.iter().enumerate() {
+            let data = chunk.proof.data();
+            ensure!(
+                data.0 == EpochIndex::new(epoch),
+                "chunk {index} belongs to another epoch"
+            );
+            ensure!(
+                data.3 == discriminant,
+                "chunk {index} has another discriminant"
+            );
+            ensure!(
+                data.4 == QrProfile::ROOT && chunk.members.len() <= capacity,
+                "chunk {index} is routed or over capacity"
+            );
+            if let Some(previous) = index.checked_sub(1).and_then(|i| chunks.get(i)) {
+                ensure!(
+                    data.1 == previous.proof.data().2,
+                    "chunk {index} does not continue the previous one"
+                );
+            }
+        }
+        Ok(Self {
+            epoch,
+            discriminant,
+            capacity,
+            chunks,
+        })
+    }
+
+    pub fn chunks(&self) -> &[Intake] {
+        &self.chunks
+    }
+
+    pub fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
+    /// Seeds the block's stamps and folds them into the open chunk.
+    pub fn push_block(&mut self, block: &TachyonBlock) -> Result<()> {
+        ensure!(
+            block.epoch == self.epoch,
+            "block {} is not in epoch {}",
+            block.height,
+            self.epoch
+        );
+        let epoch = EpochIndex::new(self.epoch);
+        let mut cursor = block.entry()?;
+        for stamp in &block.stamps {
+            let members = stamp.members()?;
+            let (proof, ()) = PROOF_SYSTEM.seed(
+                &mut rand::rng(),
+                qr::QrStampIntakeSeed,
+                witness::qr_stamp_intake_seed(
+                    ((), ()),
+                    cursor,
+                    epoch,
+                    self.discriminant,
+                    &members,
+                ),
+            )?;
+            let intake = Intake { proof, members };
+            match self.chunks.last() {
+                Some(open) if open.members.len() + intake.members.len() <= self.capacity => {
+                    let open = self.chunks.pop().expect("just checked");
+                    self.chunks.push(open.merge(intake)?);
+                }
+                _ => self.chunks.push(intake),
+            }
+            cursor = cursor.next_stamp(epoch, &stamp.commitment()?)?;
+        }
+        ensure!(
+            cursor == anchor(&block.anchor_after)?,
+            "stamps do not reproduce block {}'s anchor",
+            block.height
+        );
+        Ok(())
+    }
+
+    /// Routes the accumulated chunks and seals the epoch's buckets.
+    pub fn seal(
+        self,
+        start: Anchor,
+        next: Anchor,
+        predecessor: Anchor,
+    ) -> Result<Vec<(QrProfile, Pcd<qr::QrBucket>, usize)>> {
+        let epoch = Epoch {
+            epoch: self.epoch,
+            stamps: Vec::new(),
+            start,
+            next,
+        };
+        let mut chunks = self.chunks;
+        if chunks.is_empty() {
+            let (proof, ()) = PROOF_SYSTEM.seed(
+                &mut rand::rng(),
+                qr::QrEmptyIntakeSeed,
+                witness::qr_empty_intake_seed(
+                    ((), ()),
+                    start,
+                    EpochIndex::new(self.epoch),
+                    self.discriminant,
+                ),
+            )?;
+            chunks.push(Intake {
+                proof,
+                members: Vec::new(),
+            });
+        }
+        let mut buckets = Vec::new();
+        epoch.seal_node(&[], chunks, predecessor, self.discriminant, &mut buckets)?;
+        Ok(buckets)
+    }
+}
+
+/// Accumulates an epoch's closed chunks as routed leaves at a predicted depth.
+///
+/// Option B: the depth is a guess, made when the first chunk closes. Callers
+/// compare the leaf set with `profiles(all members, r0)` at seal; a mismatch
+/// means the epoch outgrew (or undershot) the prediction, and the persisted
+/// chunks are re-routed instead. A wrong guess costs time, never correctness.
+pub struct LeafBuilder {
+    epoch: u32,
+    depth: u32,
+    discriminant: QrDiscriminant,
+    leaves: std::collections::BTreeMap<(u32, u32), Intake>,
+}
+
+impl LeafBuilder {
+    pub fn new(epoch: u32, depth: u32, discriminant: QrDiscriminant) -> Self {
+        Self {
+            epoch,
+            depth,
+            discriminant,
+            leaves: std::collections::BTreeMap::new(),
+        }
+    }
+
+    pub fn resume(
+        epoch: u32,
+        depth: u32,
+        discriminant: QrDiscriminant,
+        leaves: Vec<(QrProfile, Intake)>,
+    ) -> Result<Self> {
+        let mut builder = Self::new(epoch, depth, discriminant);
+        for (profile, intake) in leaves {
+            let data = intake.proof.data();
+            ensure!(
+                profile.depth == depth
+                    && data.0 == EpochIndex::new(epoch)
+                    && data.3 == discriminant
+                    && data.4 == profile
+                    && intake.members.len() <= max_polynomial_members(),
+                "stored leaf does not match epoch {epoch} at depth {depth}"
+            );
+            ensure!(
+                builder
+                    .leaves
+                    .insert((profile.depth, profile.bits), intake)
+                    .is_none(),
+                "duplicate leaf {profile:?}"
+            );
+        }
+        Ok(builder)
+    }
+
+    pub fn depth(&self) -> u32 {
+        self.depth
+    }
+
+    pub fn members(&self) -> usize {
+        self.leaves.values().map(|leaf| leaf.members.len()).sum()
+    }
+
+    pub fn profiles(&self) -> Vec<QrProfile> {
+        self.leaves
+            .keys()
+            .map(|&(depth, bits)| QrProfile { depth, bits })
+            .collect()
+    }
+
+    pub fn entries(&self) -> Vec<(QrProfile, &Intake)> {
+        self.leaves
+            .iter()
+            .map(|(&(depth, bits), intake)| (QrProfile { depth, bits }, intake))
+            .collect()
+    }
+
+    /// Routes one closed chunk into the leaf accumulators. Chunks must arrive
+    /// in anchor order; members of a chunk that land on an empty side simply
+    /// contribute nothing to that leaf.
+    pub fn merge_chunk(&mut self, chunk: &Intake) -> Result<()> {
+        self.route(QrProfile::ROOT, chunk.clone())
+    }
+
+    fn route(&mut self, profile: QrProfile, intake: Intake) -> Result<()> {
+        if profile.depth == self.depth {
+            match self.leaves.get(&(profile.depth, profile.bits)).cloned() {
+                Some(left) => {
+                    self.leaves.insert(
+                        (profile.depth, profile.bits),
+                        left.merge(intake)?,
+                    );
+                }
+                None => {
+                    self.leaves.insert((profile.depth, profile.bits), intake);
+                }
+            }
+            return Ok(());
+        }
+        let (left, right) = intake.split(self.discriminant)?;
+        for (side, child) in [(false, left), (true, right)] {
+            if !child.members.is_empty() {
+                self.route(profile.descend(side), child)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Seals every accumulated leaf. Only call after the caller has checked the
+    /// leaf set against `profiles`.
+    pub fn seal(
+        self,
+        start: Anchor,
+        next: Anchor,
+        predecessor: Anchor,
+    ) -> Result<Vec<(QrProfile, Pcd<qr::QrBucket>, usize)>> {
+        let mut buckets = Vec::with_capacity(self.leaves.len());
+        for ((depth, bits), intake) in self.leaves {
+            let profile = QrProfile { depth, bits };
+            let members = intake.members.len();
+            let (bucket, ()) = PROOF_SYSTEM.fuse(
+                &mut rand::rng(),
+                qr::QrBucketSeal,
+                witness::qr_bucket_seal((*intake.proof.data(), ()), predecessor),
+                intake.proof,
+                trivial(),
+            )?;
+            let data = bucket.data();
+            ensure!(
+                data.0 == EpochIndex::new(self.epoch)
+                    && data.1 == start
+                    && data.2 == next
+                    && data.3 == self.discriminant
+                    && data.4 == profile,
+                "sealed leaf does not match its epoch and profile"
+            );
+            buckets.push((profile, bucket, members));
+        }
+        Ok(buckets)
+    }
+}
+
 struct Epoch {
     epoch: u32,
     stamps: Vec<(Anchor, Vec<Tachygram>)>,
-    members: Vec<Tachygram>,
     start: Anchor,
     next: Anchor,
 }
@@ -172,7 +454,6 @@ impl Epoch {
         Ok(Self {
             epoch,
             stamps,
-            members: members.into_iter().collect(),
             start: first.entry()?,
             next: next.entry()?,
         })
@@ -218,16 +499,27 @@ impl Epoch {
         Ok(chunks)
     }
 
-    /// Routes every chunk along `path`, merges them and seals the bucket.
-    fn build(
+    /// Seals the subtree at `path`. A node splits its intakes once and recurses
+    /// into both children, so a split is paid once per node instead of once per
+    /// leaf path. A node is a leaf once its members fit a polynomial and it is
+    /// at least `SEAL_MIN_DEPTH` deep, or once it holds no members at all.
+    fn seal_node(
         &self,
         path: &[bool],
-        chunks: &[Intake],
+        mut intakes: Vec<Intake>,
         predecessor: Anchor,
-        discriminant: QrDiscriminant,
-    ) -> Result<(Pcd<qr::QrBucket>, usize)> {
-        let mut intakes = chunks.to_vec();
-        for &side in path {
+        r0: QrDiscriminant,
+        out: &mut Vec<(QrProfile, Pcd<qr::QrBucket>, usize)>,
+    ) -> Result<()> {
+        let members: usize = intakes.iter().map(|intake| intake.members.len()).sum();
+        // Leaves split only until they fit: bucket anonymity sets stay at the
+        // minimal depth. If leaf accumulators are ever carried across blocks,
+        // this is where a predicted depth and its fallback belong.
+        if members > max_polynomial_members() {
+            ensure!(
+                path.len() < QrProfile::MAX_DEPTH,
+                "epoch cannot be routed within Tachyon's polynomial capacity"
+            );
             // QrIntakeSplit rejects empty intakes. Absorb empty spans into an
             // adjacent nonempty intake before descending, preserving coverage
             // without inventing a proof or dropping an anchor transition.
@@ -241,10 +533,18 @@ impl Epoch {
                     None => joined.push(right),
                 }
             }
-            intakes = joined
-                .into_iter()
-                .map(|intake| intake.route(&[side], discriminant))
-                .collect::<Result<_>>()?;
+            let mut sides: [Vec<Intake>; 2] = [Vec::new(), Vec::new()];
+            for intake in joined {
+                let (left, right) = intake.split(r0)?;
+                sides[0].push(left);
+                sides[1].push(right);
+            }
+            for (index, side) in sides.into_iter().enumerate() {
+                let mut child = path.to_vec();
+                child.push(index == 1);
+                self.seal_node(&child, side, predecessor, r0, out)?;
+            }
+            return Ok(());
         }
         // Balanced, adjacent merges avoid rebuilding an ever-growing prefix for
         // every stamp, while preserving the original anchor order.
@@ -271,7 +571,16 @@ impl Epoch {
             bucket.data().2 == self.next,
             "epoch evidence does not meet the next entry anchor"
         );
-        Ok((bucket, members.len()))
+        let profile = path.iter().fold(QrProfile::ROOT, |p, &b| p.descend(b));
+        ensure!(
+            bucket.data().0 == EpochIndex::new(self.epoch)
+                && bucket.data().1 == self.start
+                && bucket.data().3 == r0
+                && bucket.data().4 == profile,
+            "sealed bucket does not match its epoch and profile"
+        );
+        out.push((profile, bucket, members.len()));
+        Ok(())
     }
 }
 
@@ -449,7 +758,7 @@ mod tests {
     use zcash_tachyon::{TachygramSetPoly, pasta::Fp};
 
     use super::{testing::*, *};
-    use crate::{profile_of, verify_pcd};
+    use crate::{profile_of, profiles, verify_pcd};
 
     /// Every bucket verifies, spans `[entry(e), entry(e+1))` under `r0`, and
     /// commits to exactly the published tachygrams `profile_of` routes to it.
@@ -575,19 +884,181 @@ mod tests {
         let epoch = Epoch {
             epoch: 0,
             stamps: Vec::new(),
-            members: vec![excluded, query],
             start: Anchor::default(),
             next: cursor.next_epoch(EpochIndex::new(1))?,
         };
-        let path = [side, QrClassRoot::of(query.into(), disc.at(1)).0];
-        let (bucket, members) = epoch.build(&path, &chunks, Anchor(Fp::ZERO), disc)?;
+        // Route the first level by hand so the epoch splits even though it has
+        // only two members; the policy only deepens epochs that route at all.
+        let mut first = Vec::new();
+        for chunk in chunks {
+            let (left, right) = chunk.split(disc)?;
+            first.push(if side { right } else { left });
+        }
+        // Empty intakes cannot be split: absorb them into a neighbour first,
+        // exactly as the seal does before descending.
+        let mut joined: Vec<Intake> = Vec::new();
+        for right in first {
+            match joined.pop() {
+                Some(left) if left.members.is_empty() || right.members.is_empty() => {
+                    joined.push(left.merge(right)?);
+                }
+                Some(left) => joined.extend([left, right]),
+                None => joined.push(right),
+            }
+        }
+        let second = QrClassRoot::of(query.into(), disc.at(1)).0;
+        let mut next = Vec::new();
+        for chunk in joined {
+            let (left, right) = chunk.split(disc)?;
+            next.push(if second { right } else { left });
+        }
+        let mut buckets = Vec::new();
+        epoch.seal_node(&[side, second], next, Anchor(Fp::ZERO), disc, &mut buckets)?;
+        let (profile, bucket, members) = buckets
+            .into_iter()
+            .find(|(_, _, members)| *members == 1)
+            .expect("a bucket holds the query");
         assert_eq!(members, 1);
         assert_eq!(bucket.data().1, Anchor::default());
-        assert_eq!(
-            bucket.data().4,
-            QrProfile::ROOT.descend(path[0]).descend(path[1])
-        );
+        assert_eq!(profile, QrProfile::ROOT.descend(side).descend(second));
         assert!(verify_pcd(&bucket)?);
+        Ok(())
+    }
+
+    #[test]
+    fn chunk_builder_matches_a_one_shot_seal() -> Result<()> {
+        let mut blocks = vec![genesis()];
+        mine_to_epoch(&mut blocks, 1)?;
+        populate_epoch(&mut blocks, 300)?;
+        populate_epoch(&mut blocks, 120)?;
+        mine_to_epoch(&mut blocks, 2)?;
+        let (inputs, predecessor) = epoch_inputs(&blocks, 1)?;
+        let r0 = QrDiscriminant(Fp::ONE);
+        let start = inputs
+            .iter()
+            .find(|b| b.epoch == 1)
+            .expect("epoch 1 blocks")
+            .entry()?;
+        let next = inputs
+            .iter()
+            .find(|b| b.epoch == 2)
+            .expect("epoch 2 block")
+            .entry()?;
+
+        let mut builder = ChunkBuilder::new(1, r0, max_polynomial_members());
+        for block in inputs.iter().filter(|b| b.epoch == 1) {
+            builder.push_block(block)?;
+        }
+        let incremental = builder.seal(start, next, predecessor)?;
+        let batch = build_epoch(&inputs, predecessor, r0)?;
+
+        let mut a: Vec<_> = incremental.iter().map(|b| (b.0, b.2)).collect();
+        let mut b: Vec<_> = batch.iter().map(|b| (b.0, b.2)).collect();
+        a.sort_by_key(|(profile, _)| (profile.depth, profile.bits));
+        b.sort_by_key(|(profile, _)| (profile.depth, profile.bits));
+        assert_eq!(a, b);
+        for (_, bucket, _) in &incremental {
+            assert!(verify_pcd(bucket)?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn leaf_builder_matches_a_one_shot_seal() -> Result<()> {
+        let mut blocks = vec![genesis()];
+        mine_to_epoch(&mut blocks, 1)?;
+        populate_epoch(&mut blocks, 9_000)?;
+        mine_to_epoch(&mut blocks, 2)?;
+        let (inputs, predecessor) = epoch_inputs(&blocks, 1)?;
+        let r0 = QrDiscriminant(Fp::ONE);
+        let start = inputs
+            .iter()
+            .find(|b| b.epoch == 1)
+            .expect("epoch 1 blocks")
+            .entry()?;
+        let next = inputs
+            .iter()
+            .find(|b| b.epoch == 2)
+            .expect("epoch 2 block")
+            .entry()?;
+
+        let mut chunks = ChunkBuilder::new(1, r0, max_polynomial_members());
+        for block in inputs.iter().filter(|b| b.epoch == 1) {
+            chunks.push_block(block)?;
+        }
+        let chunks = chunks.chunks().to_vec();
+        let mut leaves = LeafBuilder::new(1, 1, r0);
+        for chunk in &chunks {
+            leaves.merge_chunk(chunk)?;
+        }
+        assert_eq!(leaves.members(), 9_000);
+        let leaf_buckets = leaves.seal(start, next, predecessor)?;
+        let batch = build_epoch(&inputs, predecessor, r0)?;
+
+        let mut a: Vec<_> = leaf_buckets.iter().map(|b| (b.0, b.2)).collect();
+        let mut b: Vec<_> = batch.iter().map(|b| (b.0, b.2)).collect();
+        a.sort_by_key(|(profile, _)| (profile.depth, profile.bits));
+        b.sort_by_key(|(profile, _)| (profile.depth, profile.bits));
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 2);
+        for (_, bucket, _) in &leaf_buckets {
+            assert!(verify_pcd(bucket)?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn intake_pcds_round_trip_through_chunk_bytes() -> Result<()> {
+        let members = vec![Tachygram::from(Fp::from(1)), Tachygram::from(Fp::from(2))];
+        let (proof, ()) = PROOF_SYSTEM.seed(
+            &mut rand::rng(),
+            qr::QrStampIntakeSeed,
+            witness::qr_stamp_intake_seed(
+                ((), ()),
+                Anchor::default(),
+                EpochIndex::new(0),
+                QrDiscriminant(Fp::ONE),
+                &members,
+            ),
+        )?;
+        let bytes = crate::pcd_to_bytes(&proof)?;
+        let back: Pcd<qr::QrIntake> = crate::pcd_from_bytes(&bytes)?;
+        assert_eq!(back.data(), proof.data());
+        assert!(verify_pcd(&back)?);
+        Ok(())
+    }
+
+    /// Phase timings for a full-size epoch. Ignored: run in release with
+    /// `cargo test -p oss-core seal_benchmark --release -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn seal_benchmark() -> Result<()> {
+        use std::time::Instant;
+
+        let mut blocks = vec![genesis()];
+        mine_to_epoch(&mut blocks, 1)?;
+        populate_epoch(&mut blocks, 220_000)?;
+        mine_to_epoch(&mut blocks, 2)?;
+        let (inputs, predecessor) = epoch_inputs(&blocks, 1)?;
+        let r0 = QrDiscriminant(Fp::ONE);
+
+        let t = Instant::now();
+        let epoch = Epoch::read(&inputs)?;
+        eprintln!("read: {:?} ({} stamps)", t.elapsed(), epoch.stamps.len());
+
+        let t = Instant::now();
+        let chunks = epoch.chunks(r0)?;
+        eprintln!("chunks: {:?} ({} chunks)", t.elapsed(), chunks.len());
+
+        let t = Instant::now();
+        let mut buckets = Vec::new();
+        epoch.seal_node(&[], chunks, predecessor, r0, &mut buckets)?;
+        eprintln!(
+            "tree: {:?} ({} buckets, depth {})",
+            t.elapsed(),
+            buckets.len(),
+            buckets.first().map_or(0, |b| b.0.depth)
+        );
         Ok(())
     }
 
@@ -618,7 +1089,8 @@ mod tests {
                     .collect::<TachygramSetPoly>()
                     .commit(),
             )?;
-            intakes.push(Intake { proof, members }.route(&[side], discriminant)?);
+            let (left, right) = Intake { proof, members }.split(discriminant)?;
+            intakes.push(if side { right } else { left });
         }
         assert!(intakes[0].members.is_empty());
         assert!(intakes[1].members.is_empty());

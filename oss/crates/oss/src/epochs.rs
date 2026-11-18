@@ -36,9 +36,20 @@ pub fn seal_epoch(
     )?;
     let r0 = discriminant(conn, epoch)?.context("missing discriminant")?;
     let buckets = build_epoch(blocks, predecessor, r0)?;
+    write_evidence(conn, epoch, closing_hash, &buckets)
+}
+
+/// Writes sealed buckets and the evidence row that publishes them. The row is
+/// written last, in the same transaction: its presence means every bucket is.
+pub fn write_evidence(
+    conn: &Connection,
+    epoch: u32,
+    closing_hash: &str,
+    buckets: &[(QrProfile, Pcd<QrBucket>, usize)],
+) -> Result<()> {
     let mut profiles = Vec::with_capacity(buckets.len());
     let tx = conn.unchecked_transaction()?;
-    for (profile, pcd, members) in &buckets {
+    for (profile, pcd, members) in buckets {
         tx.execute(
             "INSERT OR REPLACE INTO buckets(epoch, closing_hash, depth, bits, members, pcd)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -47,7 +58,7 @@ pub fn seal_epoch(
                 closing_hash,
                 profile.depth,
                 profile.bits,
-                members,
+                u32::try_from(*members)?,
                 pcd_to_bytes(pcd)?
             ],
         )?;

@@ -26,6 +26,19 @@ CREATE TABLE IF NOT EXISTS buckets(epoch INTEGER NOT NULL, closing_hash TEXT NOT
 CREATE TABLE IF NOT EXISTS spans(epoch INTEGER NOT NULL, chunk INTEGER NOT NULL,
   start_anchor BLOB NOT NULL, end_height INTEGER NOT NULL, members BLOB NOT NULL,
   pcd BLOB NOT NULL, PRIMARY KEY(epoch, chunk));
+CREATE TABLE IF NOT EXISTS epoch_chunks(epoch INTEGER NOT NULL, chunk INTEGER NOT NULL,
+  end_height INTEGER NOT NULL, members BLOB NOT NULL, pcd BLOB NOT NULL,
+  PRIMARY KEY(epoch, chunk));
+-- Epochs whose chunks a reorg invalidated; their seal falls back to the archive.
+CREATE TABLE IF NOT EXISTS epoch_chunks_skip(epoch INTEGER PRIMARY KEY);
+-- Epochs whose chunk accumulation has started, even before their first member.
+CREATE TABLE IF NOT EXISTS epoch_chunks_started(epoch INTEGER PRIMARY KEY);
+-- Routed leaf accumulators for an epoch (option B: predicted depth).
+CREATE TABLE IF NOT EXISTS epoch_leaves(epoch INTEGER NOT NULL, depth INTEGER NOT NULL,
+  bits INTEGER NOT NULL, members BLOB NOT NULL, pcd BLOB NOT NULL,
+  PRIMARY KEY(epoch, depth, bits));
+CREATE TABLE IF NOT EXISTS epoch_leaves_progress(epoch INTEGER PRIMARY KEY, merged INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS epoch_leaves_skip(epoch INTEGER PRIMARY KEY);
 ";
 
 /// Opens the database at `path`, creating it and its tables if needed.
