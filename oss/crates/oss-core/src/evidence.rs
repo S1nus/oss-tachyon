@@ -1,7 +1,17 @@
 //! Closed-epoch QR evidence, routed before merging to bound polynomial size.
 //! Ported from devtool `proofs/epoch.rs`, without its caches.
+//!
+//! [`build_epoch`] routes the whole routing tree once: every internal node
+//! splits each of its intakes a single time and descends both sides, so the
+//! upper levels are shared by every bucket below them instead of being
+//! re-proven per bucket. Independent steps (stamp seeds, the splits of one
+//! level, merges inside a group, bucket seals) run as parallel batches.
 
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    num::NonZeroUsize,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use anyhow::{Context, Result, ensure};
 use zcash_tachyon::{
@@ -11,28 +21,85 @@ use zcash_tachyon::{
     witness,
 };
 
+pub use crate::par::default_threads;
 use crate::{Pcd, TachyonBlock, anchor, max_polynomial_members, profiles, trivial};
+
+/// Proof steps run by one [`build_epoch_with_stats`] call, by kind.
+#[derive(Debug, Default)]
+pub struct BuildStats {
+    pub seeds: AtomicUsize,
+    pub splits: AtomicUsize,
+    pub selects: AtomicUsize,
+    pub descends: AtomicUsize,
+    pub merges: AtomicUsize,
+    pub seals: AtomicUsize,
+}
+
+impl BuildStats {
+    /// Every proof step counted so far.
+    pub fn total(&self) -> usize {
+        [
+            &self.seeds,
+            &self.splits,
+            &self.selects,
+            &self.descends,
+            &self.merges,
+            &self.seals,
+        ]
+        .iter()
+        .map(|c| c.load(Ordering::Relaxed))
+        .sum()
+    }
+
+    fn bump(counter: &AtomicUsize) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 /// Seals every `QrBucket` of a closed epoch: one per routing leaf of
 /// [`profiles`], empty siblings included. `blocks` are the epoch's blocks plus
 /// the next epoch's first block; `predecessor` is the final anchor of the
 /// previous epoch (zero for epoch 0). Returns each profile, its bucket and its
-/// member count.
+/// member count, in [`profiles`] order.
 pub fn build_epoch(
     blocks: &[TachyonBlock],
     predecessor: Anchor,
     r0: QrDiscriminant,
 ) -> Result<Vec<(QrProfile, Pcd<qr::QrBucket>, usize)>> {
+    build_epoch_with_stats(
+        blocks,
+        predecessor,
+        r0,
+        default_threads(),
+        &BuildStats::default(),
+    )
+}
+
+/// [`build_epoch`] with an explicit worker count, recording its proof steps.
+pub fn build_epoch_with_stats(
+    blocks: &[TachyonBlock],
+    predecessor: Anchor,
+    r0: QrDiscriminant,
+    threads: NonZeroUsize,
+    stats: &BuildStats,
+) -> Result<Vec<(QrProfile, Pcd<qr::QrBucket>, usize)>> {
     let epoch = Epoch::read(blocks)?;
-    let chunks = epoch.chunks(r0)?;
+    let builder = Builder { r0, threads, stats };
+    let mut sealed = builder.route_all(&epoch, predecessor)?;
+    // Return buckets in `profiles` order, which callers and stores rely on.
     profiles(epoch.members.clone(), r0)?
         .into_iter()
         .map(|path| {
+            let index = sealed
+                .iter()
+                .position(|(p, _, _)| *p == path)
+                .context("routing tree and profiles disagree")?;
+            let (_, bucket, members) = sealed.swap_remove(index);
             let profile = path.iter().fold(QrProfile::ROOT, |p, &b| p.descend(b));
-            let (bucket, members) = epoch.build(&path, &chunks, predecessor, r0)?;
             ensure!(
                 bucket.data().0 == EpochIndex::new(epoch.epoch)
                     && bucket.data().1 == epoch.start
+                    && bucket.data().2 == epoch.next
                     && bucket.data().3 == r0
                     && bucket.data().4 == profile,
                 "sealed bucket does not match its epoch and profile"
@@ -42,66 +109,254 @@ pub fn build_epoch(
         .collect()
 }
 
+/// A sealed leaf: its root-first path, bucket and member count.
+type SealedLeaf = (Vec<bool>, Pcd<qr::QrBucket>, usize);
+
 #[derive(Clone)]
 struct Intake {
     proof: Pcd<qr::QrIntake>,
     members: Vec<Tachygram>,
 }
 
-impl Intake {
-    fn route(mut self, path: &[bool], discriminant: QrDiscriminant) -> Result<Self> {
-        for &side in path {
-            let depth = self.proof.data().4.depth;
-            let (sides, ()) = PROOF_SYSTEM.fuse(
+struct Builder<'a> {
+    r0: QrDiscriminant,
+    threads: NonZeroUsize,
+    stats: &'a BuildStats,
+}
+
+impl Builder<'_> {
+    /// Routes the epoch's tree level by level and seals each leaf. Returns
+    /// `(path, bucket, members)` for every leaf, in no particular order.
+    fn route_all(&self, epoch: &Epoch, predecessor: Anchor) -> Result<Vec<SealedLeaf>> {
+        let mut frontier = vec![(Vec::new(), self.coalesce(self.seed(epoch)?)?)];
+        let mut leaves = Vec::new();
+        while !frontier.is_empty() {
+            let (internal, leaf): (Vec<_>, Vec<_>) =
+                frontier
+                    .into_iter()
+                    .partition(|(_, intakes): &(Vec<bool>, Vec<Intake>)| {
+                        intakes.iter().map(|i| i.members.len()).sum::<usize>()
+                            > max_polynomial_members()
+                    });
+            leaves.extend(leaf);
+            for (path, _) in &internal {
+                ensure!(
+                    path.len() < QrProfile::MAX_DEPTH,
+                    "epoch cannot be routed within Tachyon's polynomial capacity"
+                );
+            }
+            // One split per intake of this level, all independent.
+            let jobs: Vec<(usize, Intake)> = internal
+                .iter()
+                .enumerate()
+                .flat_map(|(node, (_, intakes))| intakes.iter().cloned().map(move |i| (node, i)))
+                .collect();
+            let halves = self.par_map(jobs, |(node, intake)| Ok((node, self.split(intake)?)))?;
+            let mut children: Vec<[Vec<Intake>; 2]> =
+                internal.iter().map(|_| [Vec::new(), Vec::new()]).collect();
+            // `par_map` keeps order, so each child keeps its anchor order.
+            for (node, [no, yes]) in halves {
+                children[node][0].push(no);
+                children[node][1].push(yes);
+            }
+            let next: Vec<(Vec<bool>, Vec<Intake>)> = internal
+                .into_iter()
+                .zip(children)
+                .flat_map(|((path, _), sides)| {
+                    sides
+                        .into_iter()
+                        .zip([false, true])
+                        .map(move |(intakes, side)| {
+                            let mut child = path.clone();
+                            child.push(side);
+                            (child, intakes)
+                        })
+                })
+                .collect();
+            frontier = next
+                .into_iter()
+                .map(|(path, intakes)| Ok((path, self.coalesce(intakes)?)))
+                .collect::<Result<_>>()?;
+        }
+        self.par_map(leaves, |(path, intakes)| {
+            let Intake { proof, members } =
+                self.merge_all(intakes)?.context("missing epoch intake")?;
+            Self::bump(&self.stats.seals);
+            let (bucket, ()) = PROOF_SYSTEM.fuse(
                 &mut rand::rng(),
-                qr::QrIntakeSplit,
-                witness::qr_intake_split((*self.proof.data(), ()), &self.members),
-                self.proof,
+                qr::QrBucketSeal,
+                witness::qr_bucket_seal((*proof.data(), ()), predecessor),
+                proof,
                 trivial(),
             )?;
+            Ok((path, bucket, members.len()))
+        })
+    }
+
+    /// One intake per stamp, in anchor order; one empty intake if none.
+    fn seed(&self, epoch: &Epoch) -> Result<Vec<Intake>> {
+        let index = EpochIndex::new(epoch.epoch);
+        if epoch.stamps.is_empty() {
+            Self::bump(&self.stats.seeds);
+            let (proof, ()) = PROOF_SYSTEM.seed(
+                &mut rand::rng(),
+                qr::QrEmptyIntakeSeed,
+                witness::qr_empty_intake_seed(((), ()), epoch.start, index, self.r0),
+            )?;
+            return Ok(vec![Intake {
+                proof,
+                members: Vec::new(),
+            }]);
+        }
+        self.par_map(epoch.stamps.clone(), |(before, members)| {
+            Self::bump(&self.stats.seeds);
+            let (proof, ()) = PROOF_SYSTEM.seed(
+                &mut rand::rng(),
+                qr::QrStampIntakeSeed,
+                witness::qr_stamp_intake_seed(((), ()), before, index, self.r0, &members),
+            )?;
+            Ok(Intake { proof, members })
+        })
+    }
+
+    /// Merges adjacent intakes into as few capacity-bounded groups as a
+    /// greedy left-to-right pass allows. Empty intakes always join a
+    /// neighbour, so `QrIntakeSplit` never sees one unless the node is empty.
+    /// Groups are found from member counts first, then merged in parallel.
+    fn coalesce(&self, intakes: Vec<Intake>) -> Result<Vec<Intake>> {
+        let mut groups: Vec<Vec<Intake>> = Vec::new();
+        let mut size = 0;
+        for intake in intakes {
+            match groups.last_mut() {
+                Some(group) if size + intake.members.len() <= max_polynomial_members() => {
+                    size += intake.members.len();
+                    group.push(intake);
+                }
+                _ => {
+                    size = intake.members.len();
+                    groups.push(vec![intake]);
+                }
+            }
+        }
+        if groups.len() == 1 {
+            // A single group is merged by `merge_all`'s own parallel rounds.
+            return Ok(self
+                .merge_all(groups.pop().expect("one group"))?
+                .into_iter()
+                .collect());
+        }
+        self.par_map(groups, |group| {
+            Ok(self
+                .merge_all_serial(group)?
+                .expect("groups are never empty"))
+        })
+    }
+
+    /// Balanced adjacent merges, each round in parallel. Order is preserved.
+    fn merge_all(&self, mut intakes: Vec<Intake>) -> Result<Option<Intake>> {
+        while intakes.len() > 1 {
+            let mut pairs = Vec::new();
+            let mut it = intakes.into_iter();
+            while let Some(left) = it.next() {
+                pairs.push((left, it.next()));
+            }
+            intakes = self.par_map(pairs, |(left, right)| match right {
+                Some(right) => self.merge(left, right),
+                None => Ok(left),
+            })?;
+        }
+        Ok(intakes.pop())
+    }
+
+    /// [`Self::merge_all`] on the calling thread, for use inside a batch.
+    fn merge_all_serial(&self, mut intakes: Vec<Intake>) -> Result<Option<Intake>> {
+        while intakes.len() > 1 {
+            let mut merged = Vec::new();
+            let mut it = intakes.into_iter();
+            while let Some(left) = it.next() {
+                merged.push(match it.next() {
+                    Some(right) => self.merge(left, right)?,
+                    None => left,
+                });
+            }
+            intakes = merged;
+        }
+        Ok(intakes.pop())
+    }
+
+    fn merge(&self, left: Intake, right: Intake) -> Result<Intake> {
+        ensure!(
+            left.members.len() + right.members.len() <= max_polynomial_members(),
+            "routed epoch bucket exceeds Tachyon's polynomial capacity"
+        );
+        Self::bump(&self.stats.merges);
+        let (proof, ()) = PROOF_SYSTEM.fuse(
+            &mut rand::rng(),
+            qr::QrIntakeMerge,
+            witness::qr_intake_merge(
+                (*left.proof.data(), *right.proof.data()),
+                &left.members,
+                &right.members,
+            ),
+            left.proof,
+            right.proof,
+        )?;
+        let mut members = left.members;
+        members.extend(right.members);
+        Ok(Intake { proof, members })
+    }
+
+    /// Splits one intake once and descends both sides: `[false, true]`.
+    fn split(&self, intake: Intake) -> Result<[Intake; 2]> {
+        let depth = intake.proof.data().4.depth;
+        Self::bump(&self.stats.splits);
+        let (sides, ()) = PROOF_SYSTEM.fuse(
+            &mut rand::rng(),
+            qr::QrIntakeSplit,
+            witness::qr_intake_split((*intake.proof.data(), ()), &intake.members),
+            intake.proof,
+            trivial(),
+        )?;
+        let shift = self.r0.at(depth);
+        let descend = |side: bool| -> Result<Intake> {
+            Self::bump(&self.stats.selects);
             let (selection, ()) = PROOF_SYSTEM.fuse(
                 &mut rand::rng(),
                 qr::QrSideSelect,
-                witness::qr_side_select((*sides.data(), ()), &self.members, side),
+                witness::qr_side_select((*sides.data(), ()), &intake.members, side),
                 sides.clone(),
                 trivial(),
             )?;
-            self.proof = PROOF_SYSTEM
-                .fuse(
-                    &mut rand::rng(),
-                    qr::QrSideDescend,
-                    witness::qr_side_descend((*sides.data(), *selection.data()), side),
-                    sides,
-                    selection,
-                )?
-                .0;
-            let shift = discriminant.at(depth);
-            self.members
-                .retain(|member| QrClassRoot::of((*member).into(), shift).0 == side);
-        }
-        Ok(self)
+            Self::bump(&self.stats.descends);
+            let (proof, ()) = PROOF_SYSTEM.fuse(
+                &mut rand::rng(),
+                qr::QrSideDescend,
+                witness::qr_side_descend((*sides.data(), *selection.data()), side),
+                sides.clone(),
+                selection,
+            )?;
+            let members = intake
+                .members
+                .iter()
+                .copied()
+                .filter(|member| QrClassRoot::of((*member).into(), shift).0 == side)
+                .collect();
+            Ok(Intake { proof, members })
+        };
+        Ok([descend(false)?, descend(true)?])
     }
 
-    fn merge(mut self, right: Self) -> Result<Self> {
-        ensure!(
-            self.members.len() + right.members.len() <= max_polynomial_members(),
-            "routed epoch bucket exceeds Tachyon's polynomial capacity"
-        );
-        self.proof = PROOF_SYSTEM
-            .fuse(
-                &mut rand::rng(),
-                qr::QrIntakeMerge,
-                witness::qr_intake_merge(
-                    (*self.proof.data(), *right.proof.data()),
-                    &self.members,
-                    &right.members,
-                ),
-                self.proof,
-                right.proof,
-            )?
-            .0;
-        self.members.extend(right.members);
-        Ok(self)
+    fn bump(counter: &AtomicUsize) {
+        BuildStats::bump(counter);
+    }
+
+    fn par_map<T, R, F>(&self, items: Vec<T>, f: F) -> Result<Vec<R>>
+    where
+        T: Send,
+        R: Send,
+        F: Fn(T) -> Result<R> + Sync,
+    {
+        crate::par::par_map(self.threads, items, f)
     }
 }
 
@@ -177,24 +432,119 @@ impl Epoch {
             next: next.entry()?,
         })
     }
+}
 
-    /// One seeded intake per stamp, merged in order into capacity-sized chunks.
-    fn chunks(&self, discriminant: QrDiscriminant) -> Result<Vec<Intake>> {
-        let epoch = EpochIndex::new(self.epoch);
+/// The original per-bucket builder, kept as the oracle for [`build_epoch`]:
+/// it re-routes every chunk from the root for each bucket.
+#[cfg(any(test, feature = "testing"))]
+pub mod reference {
+    use super::*;
+
+    /// Step counts and buckets as the pre-sharing implementation produced.
+    pub fn build_epoch(
+        blocks: &[TachyonBlock],
+        predecessor: Anchor,
+        r0: QrDiscriminant,
+        stats: &BuildStats,
+    ) -> Result<Vec<(QrProfile, Pcd<qr::QrBucket>, usize)>> {
+        let epoch = Epoch::read(blocks)?;
+        let chunks = chunks(&epoch, r0, stats)?;
+        profiles(epoch.members.clone(), r0)?
+            .into_iter()
+            .map(|path| {
+                let profile = path.iter().fold(QrProfile::ROOT, |p, &b| p.descend(b));
+                let (bucket, members) = build(&epoch, &path, &chunks, predecessor, r0, stats)?;
+                Ok((profile, bucket, members))
+            })
+            .collect()
+    }
+
+    pub(super) fn route(
+        mut intake: Intake,
+        path: &[bool],
+        discriminant: QrDiscriminant,
+        stats: &BuildStats,
+    ) -> Result<Intake> {
+        for &side in path {
+            let depth = intake.proof.data().4.depth;
+            BuildStats::bump(&stats.splits);
+            let (sides, ()) = PROOF_SYSTEM.fuse(
+                &mut rand::rng(),
+                qr::QrIntakeSplit,
+                witness::qr_intake_split((*intake.proof.data(), ()), &intake.members),
+                intake.proof,
+                trivial(),
+            )?;
+            BuildStats::bump(&stats.selects);
+            let (selection, ()) = PROOF_SYSTEM.fuse(
+                &mut rand::rng(),
+                qr::QrSideSelect,
+                witness::qr_side_select((*sides.data(), ()), &intake.members, side),
+                sides.clone(),
+                trivial(),
+            )?;
+            BuildStats::bump(&stats.descends);
+            intake.proof = PROOF_SYSTEM
+                .fuse(
+                    &mut rand::rng(),
+                    qr::QrSideDescend,
+                    witness::qr_side_descend((*sides.data(), *selection.data()), side),
+                    sides,
+                    selection,
+                )?
+                .0;
+            let shift = discriminant.at(depth);
+            intake
+                .members
+                .retain(|member| QrClassRoot::of((*member).into(), shift).0 == side);
+        }
+        Ok(intake)
+    }
+
+    pub(super) fn merge(mut left: Intake, right: Intake, stats: &BuildStats) -> Result<Intake> {
+        ensure!(
+            left.members.len() + right.members.len() <= max_polynomial_members(),
+            "routed epoch bucket exceeds Tachyon's polynomial capacity"
+        );
+        BuildStats::bump(&stats.merges);
+        left.proof = PROOF_SYSTEM
+            .fuse(
+                &mut rand::rng(),
+                qr::QrIntakeMerge,
+                witness::qr_intake_merge(
+                    (*left.proof.data(), *right.proof.data()),
+                    &left.members,
+                    &right.members,
+                ),
+                left.proof,
+                right.proof,
+            )?
+            .0;
+        left.members.extend(right.members);
+        Ok(left)
+    }
+
+    pub(super) fn chunks(
+        epoch: &Epoch,
+        discriminant: QrDiscriminant,
+        stats: &BuildStats,
+    ) -> Result<Vec<Intake>> {
+        let index = EpochIndex::new(epoch.epoch);
         let mut chunks = Vec::new();
         let mut current: Option<Intake> = None;
-        for (before, members) in self.stamps.iter().cloned() {
+        for (before, members) in epoch.stamps.iter().cloned() {
+            BuildStats::bump(&stats.seeds);
             let (proof, ()) = PROOF_SYSTEM.seed(
                 &mut rand::rng(),
                 qr::QrStampIntakeSeed,
-                witness::qr_stamp_intake_seed(((), ()), before, epoch, discriminant, &members),
+                witness::qr_stamp_intake_seed(((), ()), before, index, discriminant, &members),
             )?;
             let intake = Intake { proof, members };
             current = match current.take() {
                 Some(left)
                     if left.members.len() + intake.members.len() <= max_polynomial_members() =>
                 {
-                    Some(left.merge(intake)?)
+                    Some(merge(left, intake, stats)?)
                 }
                 Some(chunk) => {
                     chunks.push(chunk);
@@ -205,10 +555,11 @@ impl Epoch {
         }
         chunks.extend(current);
         if chunks.is_empty() {
+            BuildStats::bump(&stats.seeds);
             let (proof, ()) = PROOF_SYSTEM.seed(
                 &mut rand::rng(),
                 qr::QrEmptyIntakeSeed,
-                witness::qr_empty_intake_seed(((), ()), self.start, epoch, discriminant),
+                witness::qr_empty_intake_seed(((), ()), epoch.start, index, discriminant),
             )?;
             chunks.push(Intake {
                 proof,
@@ -218,24 +569,21 @@ impl Epoch {
         Ok(chunks)
     }
 
-    /// Routes every chunk along `path`, merges them and seals the bucket.
-    fn build(
-        &self,
+    pub(super) fn build(
+        epoch: &Epoch,
         path: &[bool],
         chunks: &[Intake],
         predecessor: Anchor,
         discriminant: QrDiscriminant,
+        stats: &BuildStats,
     ) -> Result<(Pcd<qr::QrBucket>, usize)> {
         let mut intakes = chunks.to_vec();
         for &side in path {
-            // QrIntakeSplit rejects empty intakes. Absorb empty spans into an
-            // adjacent nonempty intake before descending, preserving coverage
-            // without inventing a proof or dropping an anchor transition.
             let mut joined: Vec<Intake> = Vec::new();
             for right in intakes {
                 match joined.pop() {
                     Some(left) if left.members.is_empty() || right.members.is_empty() => {
-                        joined.push(left.merge(right)?);
+                        joined.push(merge(left, right, stats)?);
                     }
                     Some(left) => joined.extend([left, right]),
                     None => joined.push(right),
@@ -243,23 +591,22 @@ impl Epoch {
             }
             intakes = joined
                 .into_iter()
-                .map(|intake| intake.route(&[side], discriminant))
+                .map(|intake| route(intake, &[side], discriminant, stats))
                 .collect::<Result<_>>()?;
         }
-        // Balanced, adjacent merges avoid rebuilding an ever-growing prefix for
-        // every stamp, while preserving the original anchor order.
         while intakes.len() > 1 {
             let mut merged = Vec::new();
             let mut pairs = intakes.into_iter();
             while let Some(left) = pairs.next() {
                 merged.push(match pairs.next() {
-                    Some(right) => left.merge(right)?,
+                    Some(right) => merge(left, right, stats)?,
                     None => left,
                 });
             }
             intakes = merged;
         }
         let Intake { proof, members } = intakes.pop().context("missing epoch intake")?;
+        BuildStats::bump(&stats.seals);
         let (bucket, ()) = PROOF_SYSTEM.fuse(
             &mut rand::rng(),
             qr::QrBucketSeal,
@@ -268,7 +615,7 @@ impl Epoch {
             trivial(),
         )?;
         ensure!(
-            bucket.data().2 == self.next,
+            bucket.data().2 == epoch.next,
             "epoch evidence does not meet the next entry anchor"
         );
         Ok((bucket, members.len()))
@@ -496,6 +843,97 @@ mod tests {
         Ok(buckets.len())
     }
 
+    /// Builds `epoch` with both builders and checks they seal the same
+    /// buckets: same profiles, member counts and headers. Returns the step
+    /// totals `(shared, reference)`.
+    fn compare_with_reference(
+        blocks: &[TachyonBlock],
+        epoch: u32,
+        r0: QrDiscriminant,
+    ) -> Result<(usize, usize)> {
+        let (inputs, predecessor) = epoch_inputs(blocks, epoch)?;
+        let shared_stats = BuildStats::default();
+        let shared =
+            build_epoch_with_stats(&inputs, predecessor, r0, default_threads(), &shared_stats)?;
+        let reference_stats = BuildStats::default();
+        let reference = reference::build_epoch(&inputs, predecessor, r0, &reference_stats)?;
+        assert_eq!(shared.len(), reference.len());
+        for ((p1, b1, m1), (p2, b2, m2)) in shared.iter().zip(&reference) {
+            assert_eq!(p1, p2);
+            assert_eq!(m1, m2);
+            assert_eq!(b1.data(), b2.data());
+            assert!(verify_pcd(b1)?);
+        }
+        Ok((shared_stats.total(), reference_stats.total()))
+    }
+
+    #[test]
+    fn shared_routing_seals_the_same_buckets_as_per_bucket_routing() -> Result<()> {
+        let mut blocks = vec![genesis()];
+        mine_to_epoch(&mut blocks, 1)?;
+        populate_epoch(&mut blocks, 3 * max_polynomial_members() + 101)?;
+        mine_to_epoch(&mut blocks, 2)?;
+        for r0 in [
+            QrDiscriminant(Fp::ONE),
+            QrDiscriminant::random(&mut rand::rng()),
+        ] {
+            let (shared, reference) = compare_with_reference(&blocks, 1, r0)?;
+            assert!(
+                shared < reference,
+                "shared {shared} vs reference {reference}"
+            );
+        }
+        assert!(check_epoch(&blocks, 1, QrDiscriminant::random(&mut rand::rng()))? >= 4);
+        Ok(())
+    }
+
+    /// `cargo test --release -p oss-core -- --ignored --nocapture epoch_build_cost`
+    #[test]
+    #[ignore = "benchmark; run explicitly"]
+    fn epoch_build_cost() -> Result<()> {
+        let sizes: Vec<usize> = std::env::var("OSS_BENCH_SIZES")
+            .unwrap_or_else(|_| "2,4,8".into())
+            .split(',')
+            .map(|s| s.trim().parse().expect("size multiplier"))
+            .collect();
+        println!("capacity,members,buckets,builder,threads,steps,non_seed_steps,seconds");
+        for multiple in sizes {
+            let mut blocks = vec![genesis()];
+            mine_to_epoch(&mut blocks, 1)?;
+            populate_epoch(&mut blocks, multiple * max_polynomial_members())?;
+            mine_to_epoch(&mut blocks, 2)?;
+            let (inputs, predecessor) = epoch_inputs(&blocks, 1)?;
+            let r0 = QrDiscriminant::random(&mut rand::rng());
+            let members = multiple * max_polynomial_members();
+            let threads_all = default_threads();
+            for (name, threads) in [("shared", NonZeroUsize::MIN), ("shared", threads_all)] {
+                let stats = BuildStats::default();
+                let start = std::time::Instant::now();
+                let out = build_epoch_with_stats(&inputs, predecessor, r0, threads, &stats)?;
+                println!(
+                    "{},{members},{},{name},{threads},{},{},{:.2}",
+                    max_polynomial_members(),
+                    out.len(),
+                    stats.total(),
+                    stats.total() - stats.seeds.load(Ordering::Relaxed),
+                    start.elapsed().as_secs_f64()
+                );
+            }
+            let stats = BuildStats::default();
+            let start = std::time::Instant::now();
+            let out = reference::build_epoch(&inputs, predecessor, r0, &stats)?;
+            println!(
+                "{},{members},{},reference,1,{},{},{:.2}",
+                max_polynomial_members(),
+                out.len(),
+                stats.total(),
+                stats.total() - stats.seeds.load(Ordering::Relaxed),
+                start.elapsed().as_secs_f64()
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn empty_epoch_yields_one_root_bucket() -> Result<()> {
         let mut blocks = vec![genesis()];
@@ -580,7 +1018,14 @@ mod tests {
             next: cursor.next_epoch(EpochIndex::new(1))?,
         };
         let path = [side, QrClassRoot::of(query.into(), disc.at(1)).0];
-        let (bucket, members) = epoch.build(&path, &chunks, Anchor(Fp::ZERO), disc)?;
+        let (bucket, members) = reference::build(
+            &epoch,
+            &path,
+            &chunks,
+            Anchor(Fp::ZERO),
+            disc,
+            &BuildStats::default(),
+        )?;
         assert_eq!(members, 1);
         assert_eq!(bucket.data().1, Anchor::default());
         assert_eq!(
@@ -618,17 +1063,20 @@ mod tests {
                     .collect::<TachygramSetPoly>()
                     .commit(),
             )?;
-            intakes.push(Intake { proof, members }.route(&[side], discriminant)?);
+            intakes.push(reference::route(
+                Intake { proof, members },
+                &[side],
+                discriminant,
+                &BuildStats::default(),
+            )?);
         }
         assert!(intakes[0].members.is_empty());
         assert!(intakes[1].members.is_empty());
         assert_eq!(intakes[2].members, vec![query]);
         let mut intakes = intakes.into_iter();
-        let intake = intakes
-            .next()
-            .unwrap()
-            .merge(intakes.next().unwrap())?
-            .merge(intakes.next().unwrap())?;
+        let stats = BuildStats::default();
+        let first = reference::merge(intakes.next().unwrap(), intakes.next().unwrap(), &stats)?;
+        let intake = reference::merge(first, intakes.next().unwrap(), &stats)?;
         assert_eq!(intake.proof.data().1, Anchor::default());
         assert_eq!(intake.proof.data().2, anchor);
         let (bucket, ()) = PROOF_SYSTEM.fuse(
