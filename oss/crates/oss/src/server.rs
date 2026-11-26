@@ -6,6 +6,7 @@ use std::{
     fs::OpenOptions,
     future::{Future, IntoFuture},
     io::Write,
+    num::NonZeroUsize,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::{
@@ -34,7 +35,7 @@ use oss_core::{
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use tokio::{net::TcpListener, sync::Semaphore, task::JoinHandle};
+use tokio::{net::TcpListener, task::JoinHandle};
 use tower_http::compression::CompressionLayer;
 use udon::field::Field;
 use zcash_tachyon::constants::EPOCH_SIZE;
@@ -120,7 +121,7 @@ pub(crate) struct Shared {
     pub(crate) db: PathBuf,
     /// The Basic-auth password (the cookie token), if auth is on.
     pub(crate) cookie: Option<String>,
-    pub(crate) jobs: Arc<Semaphore>,
+    pub(crate) unspent: unspent_service::Batcher,
     /// The node's height, polled every second.
     pub(crate) node_height: Arc<AtomicU32>,
 }
@@ -241,14 +242,9 @@ async fn call(shared: &Shared, method: &str, params: Value) -> Result<Value> {
         "oss_unspent" => {
             let params: oss_core::UnspentParams = parse(params)?;
             let job = read(shared, move |conn| unspent_service::check(conn, &params)).await?;
-            // The slot moves into the proving thread: if the client hangs up,
-            // axum drops this future, but the proof runs on and keeps its slot.
-            let permit = shared.jobs.clone().acquire_owned().await?;
-            read(shared, move |conn| {
-                let _permit = permit;
-                json(unspent_service::prove(conn, &job)?)
-            })
-            .await
+            // Batched with other clients' jobs. If the client hangs up, axum
+            // drops this future, but its batch proves on.
+            json(shared.unspent.prove(job).await?)
         }
         _ => Err(Failure::MethodNotFound(method.into()).into()),
     }
@@ -524,6 +520,10 @@ pub async fn start(config: &Config) -> Result<Oss> {
         config.max_unspent_jobs > 0,
         "--max-unspent-jobs must be positive"
     );
+    ensure!(
+        config.unspent_batch_max > 0,
+        "--unspent-batch-max must be positive"
+    );
     let node = || Node::new(&config.node_url, config.node_cookie.clone());
     let backfill = config
         .backfill_url
@@ -559,7 +559,12 @@ pub async fn start(config: &Config) -> Result<Oss> {
         shared: Arc::new(Shared {
             db: config.db.clone(),
             cookie,
-            jobs: Arc::new(Semaphore::new(config.max_unspent_jobs)),
+            unspent: unspent_service::Batcher::spawn(
+                config.db.clone(),
+                NonZeroUsize::new(config.max_unspent_jobs).expect("checked positive"),
+                config.unspent_batch_max,
+                Duration::from_millis(config.unspent_batch_window_ms),
+            ),
             node_height,
         }),
     })

@@ -11,4 +11,4 @@ pub mod unspent;
 pub use evidence::build_epoch;
 pub use protocol::*;
 pub use spans::{SpanBuilder, SpanChunk, Spans};
-pub use unspent::prove_unspent;
+pub use unspent::{UnspentJob, prove_unspent, prove_unspent_batch};
