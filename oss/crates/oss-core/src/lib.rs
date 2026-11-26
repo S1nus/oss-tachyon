@@ -3,6 +3,7 @@
 
 pub mod chain;
 pub mod evidence;
+pub mod par;
 pub mod protocol;
 pub mod spans;
 pub mod unspent;
