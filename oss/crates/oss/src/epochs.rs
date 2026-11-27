@@ -90,14 +90,27 @@ pub fn bucket(
     closing_hash: &str,
     profile: QrProfile,
 ) -> Result<Option<Pcd<QrBucket>>> {
-    conn.query_row(
-        "SELECT pcd FROM buckets WHERE epoch = ?1 AND closing_hash = ?2 AND depth = ?3 AND bits = ?4",
-        params![epoch, closing_hash, profile.depth, profile.bits],
-        |row| row.get::<_, Vec<u8>>(0),
-    )
-    .optional()?
-    .map(|bytes| pcd_from_bytes(&bytes))
-    .transpose()
+    bucket_bytes(conn, epoch, closing_hash, profile)?
+        .map(|bytes| pcd_from_bytes(&bytes))
+        .transpose()
+}
+
+/// The sealed bucket of `profile` under `closing_hash` as stored: the
+/// [`pcd_to_bytes`] encoding that [`seal_epoch`] wrote. For serving it as is,
+/// without a decode and re-encode of about 512 KiB.
+pub fn bucket_bytes(
+    conn: &Connection,
+    epoch: u32,
+    closing_hash: &str,
+    profile: QrProfile,
+) -> Result<Option<Vec<u8>>> {
+    Ok(conn
+        .query_row(
+            "SELECT pcd FROM buckets WHERE epoch = ?1 AND closing_hash = ?2 AND depth = ?3 AND bits = ?4",
+            params![epoch, closing_hash, profile.depth, profile.bits],
+            |row| row.get(0),
+        )
+        .optional()?)
 }
 
 /// The epoch's private routing discriminant `R0`. Publish it only once

@@ -311,7 +311,7 @@ fn blocks(conn: &Connection, from: u32, count: u32, thin: bool) -> Result<Vec<Va
         )));
     }
     let tx = conn.unchecked_transaction()?;
-    let tip = archive::tip(&tx)?.map_or(0, |tip| tip.height);
+    let tip = archive::tip_height(&tx)?.unwrap_or(0);
     let mut blocks = Vec::new();
     let mut bytes = 0;
     for height in from..from.saturating_add(count) {
@@ -385,7 +385,7 @@ fn transactions(conn: &Connection, txids: &[String]) -> Result<TransactionsResul
         })
         .collect::<Result<Vec<_>, _>>()?;
     let tx = conn.unchecked_transaction()?;
-    let tip = archive::tip(&tx)?.map(|b| b.height);
+    let tip = archive::tip_height(&tx)?;
     if tip.is_none() || store::meta::<u32>(&tx, TXINDEX)? != tip {
         bail!(Failure::NotReady(
             "the transaction index is catching up with the archive".into()
@@ -435,14 +435,16 @@ fn bucket(
 ) -> Result<BucketResult> {
     let tx = conn.unchecked_transaction()?;
     let (closing, _) = sealed(&tx, epoch)?;
-    let pcd = epochs::bucket(&tx, epoch, &closing, profile)?.ok_or_else(|| {
+    // Served as stored: the sealer wrote it with `pcd_to_bytes`, and wallets
+    // verify every PCD they receive.
+    let pcd = epochs::bucket_bytes(&tx, epoch, &closing, profile)?.ok_or_else(|| {
         Failure::Unavailable(format!(
             "epoch {epoch} has no bucket at depth {} bits {}",
             profile.depth, profile.bits
         ))
     })?;
     Ok(BucketResult {
-        pcd: pcd_to_hex(&pcd)?,
+        pcd: hex::encode(pcd),
     })
 }
 
@@ -462,7 +464,7 @@ fn anchor_spans(conn: &Connection, from: &[String]) -> Result<AnchorSpansResult>
         .collect::<Result<Vec<_>, _>>()?;
     let Some((epoch, (target, chunks, start))) = span_store::spans_from(conn, &anchors)? else {
         let built = store::meta::<u32>(conn, builder::BUILDER_HEIGHT)?;
-        let tip = archive::tip(conn)?.map(|b| b.height);
+        let tip = archive::tip_height(conn)?;
         if tip.is_some_and(|tip| built.is_none_or(|built| built < tip)) {
             bail!(Failure::NotReady(
                 "the span builder is behind the archive".into()
@@ -485,15 +487,11 @@ fn anchor_spans(conn: &Connection, from: &[String]) -> Result<AnchorSpansResult>
 
 /// `Unavailable` for an epoch older than the archive; `NotReady` while empty.
 fn below_archive(conn: &Connection, epoch: u32) -> Result<()> {
-    let first = archive::first_height(conn)?
-        .map(|height| archive::block(conn, height))
-        .transpose()?
-        .flatten()
+    let first = archive::first_epoch(conn)?
         .ok_or_else(|| Failure::NotReady("the archive is empty".into()))?;
-    if epoch < first.epoch {
+    if epoch < first {
         bail!(Failure::Unavailable(format!(
-            "epoch {epoch} is older than the archive, which starts at epoch {}",
-            first.epoch
+            "epoch {epoch} is older than the archive, which starts at epoch {first}"
         )));
     }
     Ok(())

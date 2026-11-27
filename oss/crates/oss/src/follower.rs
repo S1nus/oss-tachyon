@@ -236,7 +236,7 @@ impl Follower {
                 .is_some_and(|pool| pool.is_multiple_of(EPOCH_SIZE)),
             "--start-height {start} must be an epoch boundary: activation {activation} plus a multiple of {EPOCH_SIZE}"
         );
-        let tip = archive::tip(&conn)?.map_or(0, |b| b.height);
+        let tip = archive::tip_height(&conn)?.unwrap_or(0);
         Ok(Self {
             conn,
             node,
