@@ -169,7 +169,7 @@ and the mempool.
 | Raw blocks and transaction bytes | **Owner.** Archive mode keeps all; pruned mode keeps ≥ `tx_retention` blocks | Never stores raw bytes |
 | Headers, `height ↔ hash`, `txid → location` | **Owner**, kept forever, but `getrawtransaction` cannot serve a pruned body | Keeps `hash`/`prev`/`height` of ingested Tachyon-era blocks for reorg detection, and every transaction ID with its height (`transactions`), so `oss_transactions` answers for pruned blocks. `meta.txindex_through` records how far it reaches; an archive from before revision 7 is indexed on the next start |
 | Two-epoch tachygram set and anchor validity set (consensus) | **Owner** | — |
-| Per-block Tachyon projection: anchors before/entry/after, stamps, tachygram-set commitments, tachygrams | Implicit in raw bytes; lost when pruned | **Owner (archive).** The verbatim `gettachyonblock` JSON per canonical block, from the OSS's start height onward |
+| Per-block Tachyon projection: anchors before/entry/after, stamps, tachygram-set commitments, tachygrams | Implicit in raw bytes; lost when pruned | **Owner (archive).** The verbatim `gettachyonblock` JSON per canonical block, from the OSS's start height onward, and a thin copy of each (`thin_blocks`: no tachygrams, no `finalized`) that thin `oss_blocks` serves without parsing; an archive from before the cache is filled at start |
 | Tachygram value → (height, stamp) index | Two-epoch window only | **Owner**, full history. Used for the `Spent` check and creation lookup |
 | Per-epoch QR evidence: private discriminant `R0`, sealed bucket PCDs, profile list (EvidenceTree later) | — | **Owner** |
 | Anchor spans (current and previous epoch) | — | **Owner** |

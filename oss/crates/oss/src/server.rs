@@ -154,12 +154,32 @@ async fn rpc(
         Ok(request) => request,
         Err(rejection) => return rejection.into_response(),
     };
-    let mut response = json!({"jsonrpc": "2.0", "id": request.id});
-    match call(&shared, &request.method, request.params).await {
-        Ok(result) => response["result"] = result,
-        Err(error) => response["error"] = error_object(&error),
-    }
-    Json(response).into_response()
+    let (result, error) = match call(&shared, &request.method, request.params).await {
+        Ok(result) => (Some(result), None),
+        Err(error) => (None, Some(error_object(&error))),
+    };
+    Json(Reply {
+        jsonrpc: "2.0",
+        id: request.id,
+        result,
+        error,
+    })
+    .into_response()
+}
+
+/// A handler's JSON result, as text.
+type Raw = Box<serde_json::value::RawValue>;
+
+/// A JSON-RPC response. `result` is raw so that a handler can answer with
+/// stored JSON text, as `oss_blocks` does, without parsing it into a tree.
+#[derive(Serialize)]
+struct Reply {
+    jsonrpc: &'static str,
+    id: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<Raw>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<Value>,
 }
 
 /// Zakura's check: the password of `Authorization: Basic …` is the cookie.
@@ -185,7 +205,7 @@ fn authorized(cookie: Option<&str>, headers: &HeaderMap) -> bool {
         })
 }
 
-async fn call(shared: &Shared, method: &str, params: Value) -> Result<Value> {
+async fn call(shared: &Shared, method: &str, params: Value) -> Result<Raw> {
     match method {
         "oss_info" => {
             let node = shared.node_height.load(Ordering::Relaxed);
@@ -196,7 +216,9 @@ async fn call(shared: &Shared, method: &str, params: Value) -> Result<Value> {
         "oss_block" => {
             let BlockParams { height, thin } = parse(params)?;
             read(shared, move |conn| {
-                Ok(blocks(conn, height, 1, thin)?.remove(0))
+                Ok(serde_json::value::RawValue::from_string(
+                    blocks(conn, height, 1, thin)?.remove(0),
+                )?)
             })
             .await
         }
@@ -204,7 +226,10 @@ async fn call(shared: &Shared, method: &str, params: Value) -> Result<Value> {
         "oss_blocks" => {
             let BlocksParams { from, count, thin } = parse(params)?;
             read(shared, move |conn| {
-                Ok(json!({"blocks": blocks(conn, from, count, thin)?}))
+                let blocks = blocks(conn, from, count, thin)?.join(",");
+                Ok(serde_json::value::RawValue::from_string(format!(
+                    "{{\"blocks\":[{blocks}]}}"
+                ))?)
             })
             .await
         }
@@ -267,8 +292,8 @@ fn parse<T: DeserializeOwned>(params: Value) -> Result<T> {
     serde_json::from_value(params).map_err(|e| Failure::InvalidParams(e.to_string()).into())
 }
 
-fn json(value: impl Serialize) -> Result<Value> {
-    Ok(serde_json::to_value(value)?)
+fn json(value: impl Serialize) -> Result<Raw> {
+    Ok(serde_json::value::to_raw_value(&value)?)
 }
 
 fn info(conn: &Connection, node_height: u32) -> Result<InfoResult> {
@@ -301,31 +326,45 @@ fn info(conn: &Connection, node_height: u32) -> Result<InfoResult> {
     })
 }
 
-/// The stored JSON of blocks `from..from + count`, read in one snapshot, with
+/// The JSON text of blocks `from..from + count`, read in one snapshot, with
 /// `finalized` recomputed from the current tip and no tachygrams if `thin`.
-/// Ends early at the archive tip or past [`MAX_BLOCKS_BYTES`].
-fn blocks(conn: &Connection, from: u32, count: u32, thin: bool) -> Result<Vec<Value>> {
+/// Thin blocks come from the cache, with no parse. Ends early at the archive
+/// tip or once the full blocks pass [`MAX_BLOCKS_BYTES`], thin or not.
+fn blocks(conn: &Connection, from: u32, count: u32, thin: bool) -> Result<Vec<String>> {
     if !(1..=MAX_BLOCKS).contains(&count) {
         bail!(Failure::InvalidParams(format!(
             "expected 1 to {MAX_BLOCKS} blocks, got {count}"
         )));
     }
     let tx = conn.unchecked_transaction()?;
-    let tip = archive::tip(&tx)?.map_or(0, |tip| tip.height);
+    let tip = archive::tip_height(&tx)?.unwrap_or(0);
     let mut blocks = Vec::new();
     let mut bytes = 0;
     for height in from..from.saturating_add(count) {
-        let Some(json) = archive::block_json(&tx, height)? else {
-            break;
+        let finalized = tip.saturating_sub(height) >= FINALITY;
+        let cached = match thin {
+            true => archive::thin_block(&tx, height)?,
+            false => None,
         };
-        bytes += json.len();
-        let mut block: Value = serde_json::from_str(&json)?;
-        block["finalized"] = json!(tip.saturating_sub(height) >= FINALITY);
-        if thin && let Some(stamps) = block["stamps"].as_array_mut() {
-            for stamp in stamps {
-                stamp["tachygrams"] = json!([]);
+        let (block, full_len) = match cached {
+            Some((body, full_len)) => (archive::with_finalized(&body, finalized)?, full_len),
+            None => {
+                let Some(json) = archive::block_json(&tx, height)? else {
+                    break;
+                };
+                let block = match thin {
+                    // Archived before the cache, which the follower fills at start.
+                    true => archive::with_finalized(&archive::thin_json(&json)?, finalized)?,
+                    false => {
+                        let mut block: Value = serde_json::from_str(&json)?;
+                        block["finalized"] = json!(finalized);
+                        serde_json::to_string(&block)?
+                    }
+                };
+                (block, json.len())
             }
-        }
+        };
+        bytes += full_len;
         blocks.push(block);
         if bytes >= MAX_BLOCKS_BYTES {
             break;
@@ -385,7 +424,7 @@ fn transactions(conn: &Connection, txids: &[String]) -> Result<TransactionsResul
         })
         .collect::<Result<Vec<_>, _>>()?;
     let tx = conn.unchecked_transaction()?;
-    let tip = archive::tip(&tx)?.map(|b| b.height);
+    let tip = archive::tip_height(&tx)?;
     if tip.is_none() || store::meta::<u32>(&tx, TXINDEX)? != tip {
         bail!(Failure::NotReady(
             "the transaction index is catching up with the archive".into()
@@ -435,14 +474,16 @@ fn bucket(
 ) -> Result<BucketResult> {
     let tx = conn.unchecked_transaction()?;
     let (closing, _) = sealed(&tx, epoch)?;
-    let pcd = epochs::bucket(&tx, epoch, &closing, profile)?.ok_or_else(|| {
+    // Served as stored: the sealer wrote it with `pcd_to_bytes`, and wallets
+    // verify every PCD they receive.
+    let pcd = epochs::bucket_bytes(&tx, epoch, &closing, profile)?.ok_or_else(|| {
         Failure::Unavailable(format!(
             "epoch {epoch} has no bucket at depth {} bits {}",
             profile.depth, profile.bits
         ))
     })?;
     Ok(BucketResult {
-        pcd: pcd_to_hex(&pcd)?,
+        pcd: hex::encode(pcd),
     })
 }
 
@@ -462,7 +503,7 @@ fn anchor_spans(conn: &Connection, from: &[String]) -> Result<AnchorSpansResult>
         .collect::<Result<Vec<_>, _>>()?;
     let Some((epoch, (target, chunks, start))) = span_store::spans_from(conn, &anchors)? else {
         let built = store::meta::<u32>(conn, builder::BUILDER_HEIGHT)?;
-        let tip = archive::tip(conn)?.map(|b| b.height);
+        let tip = archive::tip_height(conn)?;
         if tip.is_some_and(|tip| built.is_none_or(|built| built < tip)) {
             bail!(Failure::NotReady(
                 "the span builder is behind the archive".into()
@@ -485,15 +526,11 @@ fn anchor_spans(conn: &Connection, from: &[String]) -> Result<AnchorSpansResult>
 
 /// `Unavailable` for an epoch older than the archive; `NotReady` while empty.
 fn below_archive(conn: &Connection, epoch: u32) -> Result<()> {
-    let first = archive::first_height(conn)?
-        .map(|height| archive::block(conn, height))
-        .transpose()?
-        .flatten()
+    let first = archive::first_epoch(conn)?
         .ok_or_else(|| Failure::NotReady("the archive is empty".into()))?;
-    if epoch < first.epoch {
+    if epoch < first {
         bail!(Failure::Unavailable(format!(
-            "epoch {epoch} is older than the archive, which starts at epoch {}",
-            first.epoch
+            "epoch {epoch} is older than the archive, which starts at epoch {first}"
         )));
     }
     Ok(())
