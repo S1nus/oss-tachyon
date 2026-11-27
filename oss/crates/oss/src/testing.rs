@@ -279,7 +279,7 @@ impl OssHandle {
     }
 
     /// Waits until the builder has built `height`: it is archived and its
-    /// spans (and any evidence it closes) are served.
+    /// spans are served. Evidence is the sealer's: see [`Self::wait_ready`].
     pub fn wait_built(&self, height: u32) -> Result<()> {
         self.wait(builder::BUILDER_HEIGHT, height)
     }

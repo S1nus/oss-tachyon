@@ -146,8 +146,69 @@ impl Closed {
     }
 
     fn build(&self) -> Result<()> {
-        builder::catch_up(&store::open(&self.db.0)?, &|| false)
+        let conn = store::open(&self.db.0)?;
+        builder::catch_up(&conn, &|| false)?;
+        builder::seal_closed(&conn, &|| false)
     }
+}
+
+#[tokio::test]
+async fn spans_reach_the_tip_while_closed_epochs_wait_to_be_sealed() -> Result<()> {
+    let closed = Closed::new().await?;
+    let (url, blocks) = (&closed.url, &closed.blocks);
+    let tip = blocks.last().unwrap();
+    let conn = store::open(&closed.db.0)?;
+
+    // The span builder reaches the tip without sealing anything.
+    builder::catch_up(&conn, &|| false)?;
+    assert_eq!(
+        store::meta::<u32>(&conn, builder::BUILDER_HEIGHT)?,
+        Some(tip.height)
+    );
+    let info: InfoResult = call(url, "oss_info", json!({})).await?;
+    assert_eq!(info.evidence_ready_through, None);
+    let epoch0: EpochResult = call(url, "oss_epoch", json!({"epoch": 0})).await?;
+    assert_eq!(epoch0.evidence.status, EvidenceStatus::Building);
+    let from = json!({"from": [anchor_hex(blocks[first(blocks, 2)].entry()?)]});
+    let spans: AnchorSpansResult = call(url, "oss_anchorspans", from).await?;
+    assert_eq!((spans.epoch, &spans.target), (2, &tip.anchor_after));
+
+    // The sealer then seals every closed epoch, in order.
+    builder::seal_closed(&conn, &|| false)?;
+    let info: InfoResult = call(url, "oss_info", json!({})).await?;
+    assert_eq!(info.evidence_ready_through, Some(1));
+    for epoch in 0..2 {
+        let sealed: EpochResult = call(url, "oss_epoch", json!({"epoch": epoch})).await?;
+        assert_eq!(sealed.evidence.status, EvidenceStatus::Ready);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_epoch_is_marked_ready_only_under_its_canonical_closing_hash() -> Result<()> {
+    let closed = Closed::new().await?;
+    let blocks = &closed.blocks;
+    let conn = store::open(&closed.db.0)?;
+    let closing1 = blocks[first(blocks, 2) - 1].hash.clone();
+    // Nothing is ready yet: epoch 0 goes first, so epoch 1 cannot be marked.
+    assert!(!builder::mark_ready(&conn, 1, &closing1, None)?);
+    let closing0 = blocks[first(blocks, 1) - 1].hash.clone();
+    assert!(builder::mark_ready(&conn, 0, &closing0, None)?);
+    // A stale closing hash (a reorg raced the seal) is refused.
+    assert!(!builder::mark_ready(&conn, 1, &"ab".repeat(32), Some(0))?);
+    // So is a cursor that moved since it was read (a rewind lowered it).
+    assert!(!builder::mark_ready(&conn, 1, &closing1, Some(1))?);
+    assert!(builder::mark_ready(&conn, 1, &closing1, Some(0))?);
+    assert_eq!(store::meta::<u32>(&conn, builder::READY_THROUGH)?, Some(1));
+    // An open epoch has no closing hash yet.
+    assert!(!builder::mark_ready(
+        &conn,
+        2,
+        &blocks.last().unwrap().hash,
+        Some(1)
+    )?);
+    assert_eq!(store::meta::<u32>(&conn, builder::READY_THROUGH)?, Some(1));
+    Ok(())
 }
 
 #[tokio::test]
@@ -450,6 +511,7 @@ async fn a_builder_held_busy_catches_up_and_a_checkpoint_bounds_the_archive() ->
     follower.sync().await?;
     let conn = store::open(&db.0)?;
     builder::catch_up(&conn, &|| false)?;
+    builder::seal_closed(&conn, &|| false)?;
 
     let info: InfoResult = call(url, "oss_info", json!({})).await?;
     assert_eq!(info.archive_from_height, start);

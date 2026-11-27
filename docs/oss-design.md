@@ -34,6 +34,8 @@ Status: design for handoff, 2026-11-11. The companion task list is
     forgotten (`oss_transactions`).
   - Coinbase maturity comes from `gettxout`.
   - Thin sync no longer skips a note's spend check after a rewind.
+- Revision 8 seals closed epochs on their own thread (§2.4, §3), so an epoch
+  close no longer stops span building for the new epoch.
 
 Normative sources: the Tachyon book in `repos/tachyon/book/src/` (`proof-tree.md`
 §Roles, `nullifiers.md` §Delegation, `anchor.md`, `tachygrams.md`) and the code at
@@ -220,12 +222,22 @@ Optional Zakura additions for later (not needed now):
   `meta.rewind_from` to the lowest height it disconnected. Before going
   forward, the builder applies that rewind: it drops spans at or above that
   height and moves its cursor back.
+- **The sealer can never mark a stale epoch ready.** Sealing runs on its own
+  thread with its own cursor, `meta.evidence_ready_through`: it seals the
+  next closed epoch straight from the archive. It raises the cursor in one
+  conditional statement, only if the epoch's closing hash is still canonical
+  and the cursor still holds the value it read. A rewind lowers the cursor
+  below the epoch a reorg reaches, and the sealer reseals from there.
+  Evidence is keyed by closing hash, so a seal that a reorg overtook is never
+  served.
 
 ## 3. What the OSS computes, and when
 
-The OSS is one process. A follower task writes blocks. One builder thread does
-the ahead-of-time proving, catching up from the archive with its cursor
-(§2.4). The RPC server reads through read-only SQLite connections and runs
+The OSS is one process. A follower task writes blocks. Two threads do the
+ahead-of-time proving, each catching up from the archive with its own cursor
+(§2.4): the builder thread extends the anchor spans block by block (step 1),
+and the sealer thread seals each closed epoch (step 2). An epoch close takes
+seconds to minutes, and spans for the new epoch keep being built meanwhile. The RPC server reads through read-only SQLite connections and runs
 request proving on a small blocking pool. A `tokio::sync::watch` channel
 carries tip and readiness.
 
