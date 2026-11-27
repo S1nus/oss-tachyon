@@ -229,6 +229,7 @@ impl Follower {
             );
         }
         tx.commit()?;
+        cache_archived_thin(&mut conn)?;
         let start = start_height.unwrap_or(activation);
         ensure!(
             start
@@ -387,6 +388,7 @@ impl Follower {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM tachygrams WHERE height >= ?1", [fork])?;
         tx.execute("DELETE FROM blocks WHERE height >= ?1", [fork])?;
+        tx.execute("DELETE FROM thin_blocks WHERE height >= ?1", [fork])?;
         tx.execute("DELETE FROM transactions WHERE height >= ?1", [fork])?;
         tx.execute(
             "UPDATE meta SET value = ?1 WHERE key = ?2 AND CAST(value AS INTEGER) >= ?3",
@@ -425,6 +427,7 @@ impl Follower {
             }
         }
         index_transactions(&tx, block.height, txids)?;
+        archive::cache_thin(&tx, block.height, json)?;
         tx.commit()?;
         self.tip.send_replace(block.height);
         Ok(())
@@ -446,6 +449,28 @@ fn index_transactions(tx: &rusqlite::Transaction, height: u32, txids: &[String])
         params![TXINDEX, height],
     )?;
     Ok(())
+}
+
+/// Caches the thin form of every block archived before the thin cache
+/// existed, 500 blocks per transaction. Runs once, at start.
+fn cache_archived_thin(conn: &mut Connection) -> Result<()> {
+    loop {
+        let rows: Vec<(u32, String)> = conn
+            .prepare(
+                "SELECT b.height, b.json FROM blocks b LEFT JOIN thin_blocks t
+                   ON t.height = b.height WHERE t.height IS NULL ORDER BY b.height LIMIT 500",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let tx = conn.transaction()?;
+        for (height, json) in &rows {
+            archive::cache_thin(&tx, *height, json)?;
+        }
+        tx.commit()?;
+    }
 }
 
 #[cfg(test)]
@@ -486,6 +511,19 @@ mod tests {
             .map(|b| (b.height, b.hash.clone()))
             .collect();
         assert_eq!(stored, hashes);
+        // The thin cache: one row per archived block, each its thin JSON.
+        let thin: Vec<(u32, String, usize)> = conn
+            .prepare("SELECT height, json, full_len FROM thin_blocks ORDER BY height")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert_eq!(
+            thin.iter().map(|(h, ..)| *h).collect::<Vec<_>>(),
+            stored.iter().map(|(h, _)| *h).collect::<Vec<_>>()
+        );
+        for (height, json, full_len) in &thin {
+            let full = archive::block_json(conn, *height)?.context("archived")?;
+            assert_eq!((json, *full_len), (&archive::thin_json(&full)?, full.len()));
+        }
         let indexed: usize = conn.query_row("SELECT COUNT(*) FROM tachygrams", [], |r| r.get(0))?;
         let published = expected.iter().flat_map(|b| &b.stamps);
         assert_eq!(
@@ -806,6 +844,21 @@ mod tests {
         };
         assert!(error.to_string().contains("network identity changed"));
         follower(&db, &node, None, None).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fills_the_thin_cache_of_blocks_archived_before_it() -> Result<()> {
+        let mut blocks = vec![genesis()];
+        populate_epoch(&mut blocks, 3)?;
+        mine(&mut blocks)?;
+        let node = FakeNode::start(blocks.clone())?;
+        let db = TempDb::new();
+        follower(&db, &node, None, None).await?.sync().await?;
+        let conn = store::open(&db.0)?;
+        conn.execute("DELETE FROM thin_blocks", [])?;
+        follower(&db, &node, None, None).await?;
+        assert_mirrors(&conn, &node, blocks[0].height)?;
         Ok(())
     }
 }

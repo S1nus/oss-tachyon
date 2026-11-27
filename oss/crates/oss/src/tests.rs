@@ -700,3 +700,68 @@ async fn light_archive_reads_and_raw_buckets_match_the_decoded_ones() -> Result<
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn thin_pages_come_from_the_cache_and_equal_the_full_blocks_without_tachygrams() -> Result<()>
+{
+    let closed = Closed::new().await?;
+    let (url, blocks) = (&closed.url, &closed.blocks);
+    // At most one page: the whole chain if it fits.
+    let count = u32::try_from(blocks.len())?.min(oss_core::MAX_BLOCKS);
+    let from = blocks[0].height;
+    let page = |thin| json!({"from": from, "count": count, "thin": thin});
+    let thin_page = || async {
+        let thin: Value = call(url, "oss_blocks", page(true)).await?;
+        anyhow::Ok(thin["blocks"].as_array().context("blocks")?.clone())
+    };
+    let conn = store::open(&closed.db.0)?;
+    let cached = || -> Result<u32> {
+        Ok(conn.query_row("SELECT COUNT(*) FROM thin_blocks", [], |r| r.get(0))?)
+    };
+
+    // Every archived block has a cached thin copy, served as the full block
+    // with each stamp's tachygrams emptied.
+    assert_eq!(usize::try_from(cached()?)?, blocks.len());
+    let expected = made_thin(url, page(false)).await?;
+    assert_eq!(expected.len(), usize::try_from(count)?);
+    assert!(
+        expected
+            .iter()
+            .any(|b| b["stamps"].as_array().is_some_and(|s| !s.is_empty()))
+    );
+    assert_eq!(thin_page().await?, expected);
+
+    // An archive from before the cache is served the same until it is filled.
+    conn.execute("DELETE FROM thin_blocks WHERE height % 2 = 0", [])?;
+    assert!(usize::try_from(cached()?)? < blocks.len());
+    assert_eq!(thin_page().await?, expected);
+
+    // The cached text is what is served, with `finalized` spliced in.
+    let height = blocks[1].height;
+    conn.execute(
+        "UPDATE thin_blocks SET json = '{\"marker\":1}' WHERE height = ?1",
+        [height],
+    )?;
+    let one: Value = call(url, "oss_block", json!({"height": height, "thin": true})).await?;
+    let finalized = expected[1]["finalized"].clone();
+    assert!(finalized.is_boolean());
+    assert_eq!(one, json!({"finalized": finalized, "marker": 1}));
+    Ok(())
+}
+
+/// The full page at `params`, with each stamp's tachygrams emptied.
+async fn made_thin(url: &str, params: Value) -> Result<Vec<Value>> {
+    let full: Value = call(url, "oss_blocks", params).await?;
+    Ok(full["blocks"]
+        .as_array()
+        .context("blocks")?
+        .iter()
+        .cloned()
+        .map(|mut block| {
+            for stamp in block["stamps"].as_array_mut().into_iter().flatten() {
+                stamp["tachygrams"] = json!([]);
+            }
+            block
+        })
+        .collect())
+}

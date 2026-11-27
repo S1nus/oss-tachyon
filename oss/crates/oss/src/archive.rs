@@ -2,11 +2,13 @@
 //! connection works, including a read-only one.
 //!
 //! `blocks.json` is the verbatim `gettachyonblock` text. `tachygrams.stamp` is
-//! the index into that block's `stamps`.
+//! the index into that block's `stamps`. `thin_blocks.json` is that text
+//! through [`thin_json`], written with the block.
 
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use oss_core::TachyonBlock;
 use rusqlite::{Connection, OptionalExtension, params};
+use serde_json::{Value, json};
 use udon::field::Field;
 use zcash_tachyon::{Anchor, pasta::Fp};
 
@@ -121,4 +123,50 @@ pub fn tachygram_heights(conn: &Connection, values: &[Fp]) -> Result<Vec<(Fp, u3
         }
     }
     Ok(hits)
+}
+
+/// The thin form of `json`, a block's `gettachyonblock` text: every stamp's
+/// `tachygrams` emptied and `finalized` removed, since it depends on the tip
+/// and is added per request by [`with_finalized`].
+pub fn thin_json(json: &str) -> Result<String> {
+    let mut block: Value = serde_json::from_str(json)?;
+    let object = block.as_object_mut().context("a block is a JSON object")?;
+    object.remove("finalized");
+    ensure!(!object.is_empty(), "a block has fields");
+    if let Some(stamps) = object.get_mut("stamps").and_then(Value::as_array_mut) {
+        for stamp in stamps {
+            stamp["tachygrams"] = json!([]);
+        }
+    }
+    Ok(serde_json::to_string(&block)?)
+}
+
+/// A [`thin_json`] body with `finalized` set, by one splice: no parse.
+pub fn with_finalized(thin: &str, finalized: bool) -> Result<String> {
+    let rest = thin
+        .strip_prefix('{')
+        .context("a thin block is a JSON object")?;
+    Ok(format!("{{\"finalized\":{finalized},{rest}"))
+}
+
+/// The cached [`thin_json`] of the block at `height`, and the byte length of
+/// its full JSON. `None` if it is not archived, or archived before the cache
+/// and not yet filled.
+pub fn thin_block(conn: &Connection, height: u32) -> Result<Option<(String, usize)>> {
+    Ok(conn
+        .query_row(
+            "SELECT json, full_len FROM thin_blocks WHERE height = ?1",
+            [height],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?)
+}
+
+/// Caches the thin form of the block at `height`, whose text is `json`.
+pub fn cache_thin(conn: &Connection, height: u32, json: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO thin_blocks(height, json, full_len) VALUES (?1, ?2, ?3)",
+        params![height, thin_json(json)?, json.len()],
+    )?;
+    Ok(())
 }
