@@ -14,7 +14,7 @@ use oss_core::{
     ErrorCode::{InvalidParams, NotReady, Spent, Unavailable},
     EvidenceStatus, InfoResult, SpentData, TachyonBlock, UnspentResult, anchor, anchor_hex,
     evidence::testing::*,
-    pcd_from_hex, verify_pcd,
+    pcd_from_hex, pcd_to_bytes, verify_pcd,
 };
 use reqwest::{
     Client, StatusCode,
@@ -660,5 +660,43 @@ async fn three_epochs_a_reorg_across_a_sealed_boundary_and_a_restart() -> Result
     .await?;
     assert_eq!(spans.target, tip.anchor_after);
     assert_eq!(sealed_rows()?, 4);
+    Ok(())
+}
+
+#[tokio::test]
+async fn light_archive_reads_and_raw_buckets_match_the_decoded_ones() -> Result<()> {
+    let empty = TempDb::new();
+    let conn = store::open(&empty.0)?;
+    assert_eq!(archive::tip_height(&conn)?, None);
+    assert_eq!(archive::first_epoch(&conn)?, None);
+
+    let closed = Closed::new().await?;
+    closed.build()?;
+    let conn = store::open_read(&closed.db.0)?;
+    assert_eq!(
+        archive::tip_height(&conn)?,
+        archive::tip(&conn)?.map(|b| b.height)
+    );
+    let first = archive::first_height(&conn)?.context("archived")?;
+    assert_eq!(
+        archive::first_epoch(&conn)?,
+        archive::block(&conn, first)?.map(|b| b.epoch)
+    );
+    // `oss_bucket` serves the stored bytes, which are what decoding and
+    // re-encoding the bucket gives.
+    for epoch in 0..2 {
+        let closing = archive::closing_hash(&conn, epoch)?.context("closed")?;
+        for BucketProfile { profile, .. } in
+            epochs::evidence(&conn, epoch, &closing)?.context("sealed")?
+        {
+            let raw = epochs::bucket_bytes(&conn, epoch, &closing, profile)?.context("raw row")?;
+            let decoded = epochs::bucket(&conn, epoch, &closing, profile)?.context("row")?;
+            assert_eq!(raw, pcd_to_bytes(&decoded)?);
+            let params = serde_json::to_value(BucketParams { epoch, profile })?;
+            let served: BucketResult = call(&closed.url, "oss_bucket", params).await?;
+            assert_eq!(served.pcd, hex::encode(&raw));
+        }
+        assert!(epochs::bucket_bytes(&conn, epoch, "00", QrProfile::ROOT)?.is_none());
+    }
     Ok(())
 }

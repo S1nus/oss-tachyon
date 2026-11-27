@@ -26,6 +26,17 @@ pub fn tip(conn: &Connection) -> Result<Option<TachyonBlock>> {
     )
 }
 
+/// The epoch of the oldest archived block.
+pub fn first_epoch(conn: &Connection) -> Result<Option<u32>> {
+    Ok(conn
+        .query_row(
+            "SELECT epoch FROM blocks ORDER BY height LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
 /// The oldest archived height: the activation height or the checkpoint.
 pub fn first_height(conn: &Connection) -> Result<Option<u32>> {
     Ok(conn.query_row("SELECT MIN(height) FROM blocks", [], |r| r.get(0))?)
@@ -50,6 +61,11 @@ pub fn hash(conn: &Connection, height: u32) -> Result<Option<String>> {
             r.get(0)
         })
         .optional()?)
+}
+
+/// The newest archived height, without reading its block.
+pub fn tip_height(conn: &Connection) -> Result<Option<u32>> {
+    Ok(conn.query_row("SELECT MAX(height) FROM blocks", [], |r| r.get(0))?)
 }
 
 /// The epoch's blocks plus the next epoch's first block, if archived: what
