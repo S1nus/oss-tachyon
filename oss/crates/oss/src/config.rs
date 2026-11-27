@@ -31,7 +31,15 @@ pub struct Config {
     /// An archive node to fetch block bodies the node has pruned.
     #[arg(long)]
     pub backfill_url: Option<String>,
-    /// Most `oss_unspent` proving jobs at once; more requests wait.
+    /// Worker threads for one `oss_unspent` batch: proof steps of different
+    /// requests run in parallel up to this many at once.
     #[arg(long, default_value_t = 4)]
     pub max_unspent_jobs: usize,
+    /// Most `oss_unspent` requests proven in one batch; more wait for the next.
+    #[arg(long, default_value_t = 64)]
+    pub unspent_batch_max: usize,
+    /// After the first request of a batch, wait this long for others to join
+    /// it. 0 batches only what already queued while the last batch ran.
+    #[arg(long, default_value_t = 0)]
+    pub unspent_batch_window_ms: u64,
 }

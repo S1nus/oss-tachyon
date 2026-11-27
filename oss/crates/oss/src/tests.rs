@@ -22,7 +22,6 @@ use reqwest::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use tokio::sync::Semaphore;
 use udon::field::Field;
 use zcash_tachyon::{
     EpochIndex, QrProfile,
@@ -46,7 +45,12 @@ async fn serve(db: &Path, cookie: Option<&str>, node_height: u32) -> Result<Stri
     let shared = Arc::new(Shared {
         db: db.into(),
         cookie: cookie.map(Into::into),
-        jobs: Arc::new(Semaphore::new(2)),
+        unspent: crate::unspent_service::Batcher::spawn(
+            db.into(),
+            std::num::NonZeroUsize::new(2).unwrap(),
+            64,
+            std::time::Duration::ZERO,
+        ),
         node_height: Arc::new(AtomicU32::new(node_height)),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;

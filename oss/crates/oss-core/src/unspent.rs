@@ -73,6 +73,126 @@ pub fn prove_unspent(
     Ok(segment)
 }
 
+/// One `oss_unspent` request for [`prove_unspent_batch`].
+#[derive(Clone, Debug)]
+pub struct UnspentJob {
+    pub epoch_start: u32,
+    pub nfs: Vec<Nullifier>,
+}
+
+/// Proves independent [`UnspentJob`]s together, in lockstep: round `r` runs
+/// step `r` of every job that still has one, as one parallel batch on up to
+/// `threads` workers. Round 0 is all `QrUnspentInit`, later rounds all
+/// `UnspentLift`, so a batch is one circuit at a time, the shape a batched
+/// (for example GPU) backend wants.
+///
+/// Each result is exactly what [`prove_unspent`] returns for that job: one
+/// segment per job, never merged with another wallet's. A failing job does
+/// not stop the others.
+pub fn prove_unspent_batch(
+    jobs: &[UnspentJob],
+    bucket: impl Fn(usize, u32, Fp) -> Result<Pcd<qr::QrBucket>> + Sync,
+    threads: std::num::NonZeroUsize,
+) -> Vec<Result<Pcd<pool::ArbitraryUnspent>>> {
+    #[allow(clippy::large_enum_variant)]
+    enum State {
+        Pending,
+        Running(Pcd<pool::ArbitraryUnspent>),
+        Failed(anyhow::Error),
+    }
+    let mut states: Vec<State> = jobs
+        .iter()
+        .map(|job| {
+            let n = job.nfs.len();
+            if !(1..=MAX_UNSPENT_NULLIFIERS).contains(&n) {
+                return State::Failed(anyhow::anyhow!(
+                    "expected 1 to {MAX_UNSPENT_NULLIFIERS} nullifiers, got {n}"
+                ));
+            }
+            match u32::try_from(n)
+                .ok()
+                .and_then(|n| job.epoch_start.checked_add(n))
+            {
+                Some(_) => State::Pending,
+                None => State::Failed(anyhow::anyhow!("epoch overflow")),
+            }
+        })
+        .collect();
+    let rounds = jobs.iter().map(|job| job.nfs.len()).max().unwrap_or(0);
+    for round in 0..rounds {
+        let work: Vec<(usize, State)> = states
+            .iter_mut()
+            .enumerate()
+            .filter(|(i, state)| round < jobs[*i].nfs.len() && !matches!(state, State::Failed(_)))
+            .map(|(i, state)| (i, std::mem::replace(state, State::Pending)))
+            .collect();
+        let indices: Vec<usize> = work.iter().map(|(i, _)| *i).collect();
+        let stepped = crate::par::par_map_each(threads, work, |(i, state)| {
+            let job = &jobs[i];
+            let epoch = job.epoch_start + u32::try_from(round)?;
+            let nf = job.nfs[round];
+            let evidence = bucket(i, epoch, nf.into())?;
+            let value = Tachygram::from(nf);
+            Ok(match state {
+                State::Pending => {
+                    PROOF_SYSTEM
+                        .fuse(
+                            &mut rand::rng(),
+                            qr::QrUnspentInit,
+                            witness::qr_unspent_init((*evidence.data(), ()), value),
+                            evidence,
+                            trivial(),
+                        )?
+                        .0
+                }
+                State::Running(left) => {
+                    PROOF_SYSTEM
+                        .fuse(
+                            &mut rand::rng(),
+                            pool::UnspentLift,
+                            witness::unspent_lift(
+                                (*left.data(), *evidence.data()),
+                                value,
+                                &job.nfs[..round],
+                            ),
+                            left,
+                            evidence,
+                        )?
+                        .0
+                }
+                State::Failed(_) => unreachable!("failed jobs are filtered out"),
+            })
+        });
+        for (i, result) in indices.into_iter().zip(stepped) {
+            states[i] = match result {
+                Ok(segment) => State::Running(segment),
+                Err(error) => State::Failed(error),
+            };
+        }
+    }
+    states
+        .into_iter()
+        .zip(jobs)
+        .map(|(state, job)| match state {
+            State::Running(segment) => {
+                let epoch_next = job.epoch_start + u32::try_from(job.nfs.len())?;
+                let (_, start, next, _) = *segment.data();
+                ensure!(
+                    (start, next)
+                        == (
+                            EpochIndex::new(job.epoch_start),
+                            EpochIndex::new(epoch_next)
+                        ),
+                    "unspent segment does not cover the requested epochs"
+                );
+                Ok(segment)
+            }
+            State::Failed(error) => Err(error),
+            State::Pending => Err(anyhow::anyhow!("job ran no steps")),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeSet, ops::Range};
@@ -371,6 +491,69 @@ mod tests {
         assert!(oss.unspent(2, &wallet.nfs(2..t)).is_err());
         let lineage = wallet.lift(&oss, lineage, full)?;
         wallet.lift(&oss, lineage, t)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_batch_proves_each_wallet_its_own_segment_and_isolates_failures() -> Result<()> {
+        let wallets: Vec<Wallet> = (0..4).map(|_| Wallet::new()).collect::<Result<_>>()?;
+        let spent = wallets[3].nfs(0..6);
+        let oss = Oss::close(6, random_r0, |blocks, epoch| match epoch {
+            1 => populate_epoch(blocks, 40),
+            // Wallet 3's note is spent in epoch 3.
+            3 => mine_stamp(blocks, &[spent[3].into(), spent[4].into()]),
+            _ => Ok(()),
+        })?;
+        let ranges = [0..6, 2..5, 4..6, 2..5];
+        let jobs: Vec<UnspentJob> = wallets
+            .iter()
+            .zip(ranges.clone())
+            .map(|(w, r)| UnspentJob {
+                epoch_start: r.start,
+                nfs: w.nfs(r),
+            })
+            .collect();
+        let results = prove_unspent_batch(
+            &jobs,
+            |_, epoch, value| oss.bucket(epoch, value),
+            std::num::NonZeroUsize::new(3).unwrap(),
+        );
+        assert_eq!(results.len(), 4);
+        let mut results = results.into_iter();
+        for (wallet, range) in wallets.iter().zip(ranges).take(3) {
+            let segment = results.next().unwrap()?;
+            assert!(verify_pcd(&segment)?);
+            assert_eq!(
+                *segment.data(),
+                (
+                    oss.entry(range.start),
+                    EpochIndex::new(range.start),
+                    EpochIndex::new(range.end),
+                    oss.entry(range.end),
+                )
+            );
+            // The wallet binds the batched segment exactly as a single one.
+            assert_eq!(
+                *wallet.bind(segment)?.data(),
+                *wallet.bind(wallet.fetch(&oss, range)?)?.data()
+            );
+        }
+        assert!(message(results.next().unwrap()).contains("found nullifier"));
+        assert!(
+            message(
+                prove_unspent_batch(
+                    &[UnspentJob {
+                        epoch_start: 0,
+                        nfs: Vec::new()
+                    }],
+                    |_, epoch, value| oss.bucket(epoch, value),
+                    std::num::NonZeroUsize::MIN,
+                )
+                .pop()
+                .unwrap()
+            )
+            .contains("expected 1 to")
+        );
         Ok(())
     }
 
