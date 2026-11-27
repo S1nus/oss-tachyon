@@ -1,11 +1,17 @@
-//! The builder thread (design §2.4, §3): brings the span store and the epoch
-//! evidence up to the archive from its own cursor. The follower's tip `watch`
-//! only wakes it, so a missed wake-up costs nothing.
+//! The builder (design §2.4, §3): two threads, each bringing its part of the
+//! store up to the archive from its own cursor. The follower's tip `watch` only
+//! wakes them, so a missed wake-up costs nothing.
+//!
+//! - The span thread ([`catch_up`]) applies rewinds and connects every block's
+//!   stamps to the anchor spans.
+//! - The sealer ([`seal_closed`]) seals each closed epoch's QR buckets. An
+//!   epoch close takes seconds to minutes, so it runs apart: spans for the new
+//!   epoch's blocks keep being served meanwhile.
 //!
 //! `meta` keys written here:
-//! - `builder_height`: the last archived height built (spans, and the previous
-//!   epoch's evidence when the block opens an epoch).
-//! - `evidence_ready_through`: the newest epoch sealed, lowered below the
+//! - `builder_height`: the last archived height whose spans are built.
+//! - `evidence_ready_through`: the newest epoch sealed, with every older one.
+//!   The sealer raises it one epoch at a time; a rewind lowers it below the
 //!   epoch a reorg reaches.
 //! - `rewind_from`: cleared, compare-and-clear, once applied.
 
@@ -26,13 +32,22 @@ pub const READY_THROUGH: &str = "evidence_ready_through";
 /// Retry after an error even if no block arrives.
 const RETRY: Duration = Duration::from_secs(1);
 
-/// Builds on every wake-up until the follower drops its tip channel. Errors
-/// (e.g. a reorg racing a read) are logged and retried.
-pub fn run(conn: &Connection, mut tip: watch::Receiver<u32>, runtime: &Handle) {
+/// One of the builder's passes: [`catch_up`] or [`seal_closed`].
+pub type Pass = fn(&Connection, &dyn Fn() -> bool) -> Result<()>;
+
+/// Runs `pass` on every wake-up until the follower drops its tip channel.
+/// Errors (e.g. a reorg racing a read) are logged and retried.
+pub fn run(
+    name: &str,
+    pass: Pass,
+    conn: &Connection,
+    mut tip: watch::Receiver<u32>,
+    runtime: &Handle,
+) {
     loop {
         tip.mark_unchanged();
-        if let Err(e) = catch_up(conn, &|| tip.has_changed().is_err()) {
-            eprintln!("builder: {e:#}");
+        if let Err(e) = pass(conn, &|| tip.has_changed().is_err()) {
+            eprintln!("{name}: {e:#}");
         }
         let closed = runtime.block_on(async {
             tokio::select! {
@@ -46,8 +61,9 @@ pub fn run(conn: &Connection, mut tip: watch::Receiver<u32>, runtime: &Handle) {
     }
 }
 
-/// Builds every archived height above the cursor, in order, applying any
-/// pending rewind before each. Returns at the archive tip, or once `stop()`.
+/// Builds the spans of every archived height above the cursor, in order,
+/// applying any pending rewind before each. Returns at the archive tip, or
+/// once `stop()`. Sealing is [`seal_closed`]'s.
 pub fn catch_up(conn: &Connection, stop: &dyn Fn() -> bool) -> Result<()> {
     while !stop() {
         rewind(conn)?;
@@ -62,9 +78,6 @@ pub fn catch_up(conn: &Connection, stop: &dyn Fn() -> bool) -> Result<()> {
             return Ok(());
         };
         span_store::connect(conn, &block)?;
-        if block.epoch > 0 && block.epoch_start_anchor.is_some() {
-            seal(conn, block.epoch - 1)?;
-        }
         set(conn, BUILDER_HEIGHT, next)?;
     }
     Ok(())
@@ -98,12 +111,56 @@ fn rewind(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Seals `epoch` under its canonical closing hash and marks it ready. A no-op
-/// for an epoch the archive did not see in full (it starts at a checkpoint).
-fn seal(conn: &Connection, epoch: u32) -> Result<()> {
-    let Some(closing) = archive::closing_hash(conn, epoch)? else {
-        return Ok(());
-    };
+/// Seals every closed epoch above `evidence_ready_through`, oldest first, and
+/// marks each ready. Starts at the archive's first epoch if none is ready.
+/// Returns once the next epoch is still open, once `stop()`, or when a reorg
+/// moved the chain under a seal (the next pass retries).
+pub fn seal_closed(conn: &Connection, stop: &dyn Fn() -> bool) -> Result<()> {
+    while !stop() {
+        let ready = store::meta::<u32>(conn, READY_THROUGH)?;
+        let epoch = match ready {
+            Some(ready) => ready + 1,
+            None => match archive::first_epoch(conn)? {
+                Some(first) => first,
+                None => return Ok(()),
+            },
+        };
+        let Some(closing) = archive::closing_hash(conn, epoch)? else {
+            return Ok(());
+        };
+        seal(conn, epoch, &closing)?;
+        if !mark_ready(conn, epoch, &closing, ready)? {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// Sets `evidence_ready_through` to `epoch` if `closing` is still its
+/// canonical closing hash, the cursor is still `ready` (the value the sealer
+/// read), and `epoch` is the one after it (or the archive's first epoch). One
+/// statement, so a reorg or rewind that lands while the epoch seals cannot be
+/// overwritten: the sealer rereads and retries instead.
+pub(crate) fn mark_ready(
+    conn: &Connection,
+    epoch: u32,
+    closing: &str,
+    ready: Option<u32>,
+) -> Result<bool> {
+    let changed = conn.execute(
+        "INSERT INTO meta(key, value) SELECT ?1, ?2
+         WHERE (SELECT hash FROM blocks WHERE epoch = ?2
+                  AND height = (SELECT MIN(height) FROM blocks WHERE epoch = ?2 + 1) - 1) = ?3
+           AND (SELECT CAST(value AS INTEGER) FROM meta WHERE key = ?1) IS ?4
+           AND ?2 = COALESCE(?4 + 1, (SELECT epoch FROM blocks ORDER BY height LIMIT 1))
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![READY_THROUGH, epoch, closing, ready],
+    )?;
+    Ok(changed == 1)
+}
+
+/// Seals `epoch` under `closing`, its closing hash.
+fn seal(conn: &Connection, epoch: u32, closing: &str) -> Result<()> {
     let blocks = archive::epoch_blocks(conn, epoch)?;
     let first = blocks.first().context("a closed epoch has blocks")?;
     let predecessor = match epoch {
@@ -111,8 +168,7 @@ fn seal(conn: &Connection, epoch: u32) -> Result<()> {
         _ => anchor(&first.anchor_before)?,
     };
     // About 16 s for a full epoch; `seal_epoch` holds no transaction meanwhile.
-    epochs::seal_epoch(conn, epoch, &blocks, predecessor, &closing)?;
-    set(conn, READY_THROUGH, epoch)
+    epochs::seal_epoch(conn, epoch, &blocks, predecessor, closing)
 }
 
 fn set(conn: &Connection, key: &str, value: u32) -> Result<()> {

@@ -1,5 +1,5 @@
 //! JSON-RPC 2.0 over `POST /` (design §4.1, §4.2), and the process around it:
-//! the follower task, the builder thread and the server.
+//! the follower task, the builder threads and the server.
 
 use std::{
     fmt,
@@ -510,11 +510,11 @@ pub(crate) fn sealed(conn: &Connection, epoch: u32) -> Result<(String, Vec<Bucke
     Ok((closing, profiles))
 }
 
-/// A started OSS: archive identity checked, builder thread running. Call
+/// A started OSS: archive identity checked, builder and sealer running. Call
 /// [`Oss::serve`] to run the follower and the RPC server.
 pub struct Oss {
     follower: Follower,
-    builder: std::thread::JoinHandle<()>,
+    builders: [std::thread::JoinHandle<()>; 2],
     poller: JoinHandle<()>,
     shared: Arc<Shared>,
 }
@@ -544,17 +544,23 @@ pub async fn start(config: &Config) -> Result<Oss> {
     let poller_node = node()?;
     let node_height = Arc::new(AtomicU32::new(poller_node.height().await.unwrap_or(0)));
     let poller = tokio::spawn(poll_height(poller_node, node_height.clone()));
-    let (conn, tip, runtime) = (
-        store::open(&config.db)?,
-        follower.subscribe(),
-        tokio::runtime::Handle::current(),
-    );
-    let builder = std::thread::Builder::new()
-        .name("builder".into())
-        .spawn(move || builder::run(&conn, tip, &runtime))?;
+    let spawn = |name: &'static str, pass: builder::Pass| -> Result<_> {
+        let (conn, tip, runtime) = (
+            store::open(&config.db)?,
+            follower.subscribe(),
+            tokio::runtime::Handle::current(),
+        );
+        Ok(std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || builder::run(name, pass, &conn, tip, &runtime))?)
+    };
+    let builders = [
+        spawn("builder", builder::catch_up)?,
+        spawn("sealer", builder::seal_closed)?,
+    ];
     Ok(Oss {
         follower,
-        builder,
+        builders,
         poller,
         shared: Arc::new(Shared {
             db: config.db.clone(),
@@ -568,7 +574,7 @@ pub async fn start(config: &Config) -> Result<Oss> {
 impl Oss {
     /// Serves on `listener` until `shutdown` resolves, or until the follower
     /// fails ([`crate::follower::Pruned`]), which is returned. Then stops the
-    /// builder after its current block or seal.
+    /// builder after its current block and the sealer after its current seal.
     pub async fn serve(
         self,
         listener: TcpListener,
@@ -576,7 +582,7 @@ impl Oss {
     ) -> Result<()> {
         let Self {
             follower,
-            builder,
+            builders,
             poller,
             shared,
         } = self;
@@ -586,10 +592,13 @@ impl Oss {
             result = server.into_future() => result.map_err(Into::into),
         };
         poller.abort();
-        // The follower is dropped, closing its tip channel: the builder returns.
-        tokio::task::spawn_blocking(move || builder.join())
-            .await?
-            .map_err(|_| anyhow!("the builder thread panicked"))?;
+        // The follower is dropped, closing its tip channel: both threads return.
+        for thread in builders {
+            let name = thread.thread().name().unwrap_or("builder").to_owned();
+            tokio::task::spawn_blocking(move || thread.join())
+                .await?
+                .map_err(|_| anyhow!("the {name} thread panicked"))?;
+        }
         result
     }
 }
