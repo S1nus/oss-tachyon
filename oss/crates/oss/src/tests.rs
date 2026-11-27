@@ -44,7 +44,7 @@ use crate::{
 /// Serves the RPC alone, so the test drives the follower and builder by hand.
 async fn serve(db: &Path, cookie: Option<&str>, node_height: u32) -> Result<String> {
     let shared = Arc::new(Shared {
-        db: db.into(),
+        db: Arc::new(server::Readers::new(db.into())),
         cookie: cookie.map(Into::into),
         jobs: Arc::new(Semaphore::new(2)),
         node_height: Arc::new(AtomicU32::new(node_height)),
@@ -83,6 +83,58 @@ async fn fail(url: &str, method: &str, params: Value) -> Result<(i64, Value)> {
 
 async fn code(url: &str, method: &str, params: Value) -> Result<i64> {
     Ok(fail(url, method, params).await?.0)
+}
+
+#[test]
+fn read_connections_are_reused_unless_left_in_a_transaction() -> Result<()> {
+    let db = TempDb::new();
+    drop(store::open(&db.0)?);
+    let readers = server::Readers::new(db.0.clone());
+    let tables = |conn: &rusqlite::Connection| -> Result<u32> {
+        Ok(conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get(0))?)
+    };
+    // Sequential reads share one connection.
+    for _ in 0..5 {
+        assert!(readers.with(tables)? > 0);
+    }
+    assert_eq!(readers.opened(), 1);
+    // A read that fails still hands its connection back.
+    assert!(
+        readers
+            .with(|_| -> Result<()> { anyhow::bail!("boom") })
+            .is_err()
+    );
+    readers.with(tables)?;
+    assert_eq!(readers.opened(), 1);
+    // One left inside a transaction is dropped, not reused.
+    readers.with(|conn| Ok(conn.execute_batch("BEGIN")?))?;
+    readers.with(|conn| {
+        assert!(conn.is_autocommit());
+        tables(conn)
+    })?;
+    assert_eq!(readers.opened(), 2);
+    // Concurrent reads each get their own connection.
+    let barrier = std::sync::Barrier::new(4);
+    std::thread::scope(|scope| -> Result<()> {
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                scope.spawn(|| {
+                    readers.with(|conn| {
+                        barrier.wait();
+                        tables(conn)
+                    })
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("reader panicked"))??;
+        }
+        Ok(())
+    })?;
+    assert_eq!(readers.opened(), 2 + 3);
+    Ok(())
 }
 
 /// One note's nullifiers for epochs `0..n`, derived as a wallet does.

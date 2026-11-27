@@ -9,8 +9,8 @@ use std::{
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering},
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicU32, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -117,7 +117,7 @@ fn error_object(error: &anyhow::Error) -> Value {
 
 /// What every request shares.
 pub(crate) struct Shared {
-    pub(crate) db: PathBuf,
+    pub(crate) db: Arc<Readers>,
     /// The Basic-auth password (the cookie token), if auth is on.
     pub(crate) cookie: Option<String>,
     pub(crate) jobs: Arc<Semaphore>,
@@ -254,13 +254,68 @@ async fn call(shared: &Shared, method: &str, params: Value) -> Result<Value> {
     }
 }
 
-/// Runs `f` on a blocking thread with a fresh read-only connection.
+/// Runs `f` on a blocking thread with a pooled read-only connection.
 async fn read<T: Send + 'static>(
     shared: &Shared,
     f: impl FnOnce(&Connection) -> Result<T> + Send + 'static,
 ) -> Result<T> {
     let db = shared.db.clone();
-    tokio::task::spawn_blocking(move || f(&store::open_read(&db)?)).await?
+    tokio::task::spawn_blocking(move || db.with(f)).await?
+}
+
+/// How many idle read connections [`Readers`] keeps.
+const MAX_IDLE_READERS: usize = 16;
+
+/// Read-only connections to the database, reused across requests instead of
+/// opened per request (an open maps the WAL index and re-reads the schema).
+/// Each is lent to one request at a time: they are opened `NO_MUTEX`.
+pub(crate) struct Readers {
+    path: PathBuf,
+    idle: Mutex<Vec<Connection>>,
+    opened: AtomicUsize,
+}
+
+impl Readers {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            idle: Mutex::new(Vec::new()),
+            opened: AtomicUsize::new(0),
+        }
+    }
+
+    /// Runs `f` with an idle connection, or a new one if none is idle. The
+    /// connection goes back afterwards, unless `f` left a transaction open
+    /// on it (it is dropped, which rolls the transaction back).
+    pub(crate) fn with<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let idle = self.idle().pop();
+        let conn = match idle {
+            Some(conn) => conn,
+            None => {
+                self.opened.fetch_add(1, Ordering::Relaxed);
+                store::open_read(&self.path)?
+            }
+        };
+        let result = f(&conn);
+        if conn.is_autocommit() {
+            let mut idle = self.idle();
+            if idle.len() < MAX_IDLE_READERS {
+                idle.push(conn);
+            }
+        }
+        result
+    }
+
+    /// How many connections were ever opened.
+    #[cfg(test)]
+    pub(crate) fn opened(&self) -> usize {
+        self.opened.load(Ordering::Relaxed)
+    }
+
+    fn idle(&self) -> MutexGuard<'_, Vec<Connection>> {
+        // A panic while the lock is held leaves the list intact.
+        self.idle.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 fn parse<T: DeserializeOwned>(params: Value) -> Result<T> {
@@ -557,7 +612,7 @@ pub async fn start(config: &Config) -> Result<Oss> {
         builder,
         poller,
         shared: Arc::new(Shared {
-            db: config.db.clone(),
+            db: Arc::new(Readers::new(config.db.clone())),
             cookie,
             jobs: Arc::new(Semaphore::new(config.max_unspent_jobs)),
             node_height,
