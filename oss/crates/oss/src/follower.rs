@@ -7,7 +7,7 @@
 //! - `rewind_from`: the lowest height a reorg disconnected since the builder
 //!   last cleared it. Lowered in the same transaction that deletes the rows.
 
-use std::{fmt, path::PathBuf, time::Duration};
+use std::{collections::VecDeque, fmt, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use oss_core::{TachyonBlock, bytes32, chain};
@@ -15,7 +15,7 @@ use reqwest::{Client, Url};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json, value::RawValue};
-use tokio::sync::watch;
+use tokio::{sync::watch, task::JoinHandle};
 use zcash_tachyon::constants::EPOCH_SIZE;
 
 use crate::{archive, store};
@@ -70,7 +70,8 @@ struct Envelope {
 }
 
 /// Zakura JSON-RPC, as devtool's `rpc::Rpc`: optional cookie auth, no
-/// credentials in the URL, a bounded body.
+/// credentials in the URL, a bounded body. Clones share one connection pool.
+#[derive(Clone)]
 pub struct Node {
     client: Client,
     url: Url,
@@ -282,14 +283,17 @@ impl Follower {
         let node_tip = self.node.height().await?;
         let mut parent = self.reconcile(node_tip).await?;
         self.index_archived().await?;
+        let mut ahead = Prefetch::new(self.node.clone(), self.backfill.clone(), node_tip);
         loop {
             let height = parent.as_ref().map_or(self.start, |p| p.height + 1);
             if height > node_tip {
                 return Ok(());
             }
-            let (json, block) = self.fetch(height).await?;
+            let (json, block, txids) = ahead.next(height).await?;
             match &parent {
                 Some(p) if p.hash != block.previous_block_hash => {
+                    // What was fetched ahead may be the old branch's.
+                    ahead.clear();
                     let rewound = self.reconcile(node_tip).await?;
                     ensure!(
                         rewound.as_ref().map(|b| &b.hash) != Some(&p.hash),
@@ -301,36 +305,16 @@ impl Follower {
                 Some(p) => chain::validate(&block, Some(p), self.activation)?,
                 None => chain::validate_checkpoint(&block, self.activation)?,
             }
-            let txids = self.transactions(&block.hash).await?;
             self.commit(&json, &block, &txids)?;
             parent = Some(block);
         }
     }
 
+    /// The block's transaction IDs, from the backfill node if the node fails.
     // `&mut`: a shared `&Follower` holds the `!Sync` connection, so it cannot
     // cross an await in a spawned task.
-    async fn fetch(&mut self, height: u32) -> Result<(String, TachyonBlock)> {
-        match self.node.tachyon_block(height).await {
-            Err(e) if is_pruned(&e) => {
-                let backfill = self.backfill.as_ref().ok_or(Pruned(height))?;
-                let fetched = backfill.tachyon_block(height).await?;
-                ensure!(
-                    fetched.1.hash == self.node.hash(height).await?,
-                    "backfill block {height} is not on the node's best chain"
-                );
-                Ok(fetched)
-            }
-            result => result,
-        }
-    }
-
-    /// The block's transaction IDs, from the backfill node if the node fails.
-    // `&mut` for the same reason as `fetch`.
     async fn transactions(&mut self, hash: &str) -> Result<Vec<String>> {
-        match (self.node.transactions(hash).await, &self.backfill) {
-            (Err(e), Some(backfill)) if e.is::<RpcError>() => backfill.transactions(hash).await,
-            (result, _) => result,
-        }
+        transactions(&self.node, self.backfill.as_ref(), hash).await
     }
 
     /// Indexes the transactions of blocks archived before the index existed
@@ -431,6 +415,102 @@ impl Follower {
     }
 }
 
+/// How many heights the follower fetches ahead of the one it validates.
+const PREFETCH: usize = 16;
+
+/// A fetched block: its verbatim `gettachyonblock` text, its parse, and its
+/// transaction IDs.
+type Fetched = (String, TachyonBlock, Vec<String>);
+
+/// Fetches up to [`PREFETCH`] heights ahead of the follower, each on its own
+/// task, so catch-up is not bound by one node round trip per request. Results
+/// come back in height order. It only fetches: every check on a block, and
+/// reorg detection, stays with the follower, which validates each block
+/// against its parent before committing it.
+struct Prefetch {
+    node: Node,
+    backfill: Option<Node>,
+    /// The node tip the sync is bounded by.
+    tip: u32,
+    queue: VecDeque<(u32, JoinHandle<Result<Fetched>>)>,
+}
+
+impl Prefetch {
+    fn new(node: Node, backfill: Option<Node>, tip: u32) -> Self {
+        Self {
+            node,
+            backfill,
+            tip,
+            queue: VecDeque::new(),
+        }
+    }
+
+    /// The block at `height`, at most `tip`. Starts over from `height` if the
+    /// queue was fetched for other heights (after a reorg), and tops it up.
+    async fn next(&mut self, height: u32) -> Result<Fetched> {
+        if self
+            .queue
+            .front()
+            .is_some_and(|(queued, _)| *queued != height)
+        {
+            self.clear();
+        }
+        let mut next = self.queue.back().map_or(height, |(queued, _)| queued + 1);
+        while self.queue.len() < PREFETCH && next <= self.tip {
+            let (node, backfill) = (self.node.clone(), self.backfill.clone());
+            let task = tokio::spawn(async move { fetch(&node, backfill.as_ref(), next).await });
+            self.queue.push_back((next, task));
+            next += 1;
+        }
+        let (_, task) = self
+            .queue
+            .pop_front()
+            .with_context(|| format!("block {height} is above the node tip {}", self.tip))?;
+        task.await?
+    }
+
+    /// Drops everything fetched ahead.
+    fn clear(&mut self) {
+        for (_, task) in self.queue.drain(..) {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for Prefetch {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+/// The block at `height` and its transaction IDs. A body the node pruned comes
+/// from the backfill node, checked against the node's best chain; without one
+/// it is [`Pruned`].
+async fn fetch(node: &Node, backfill: Option<&Node>, height: u32) -> Result<Fetched> {
+    let (json, block) = match node.tachyon_block(height).await {
+        Err(e) if is_pruned(&e) => {
+            let backfill = backfill.ok_or(Pruned(height))?;
+            let fetched = backfill.tachyon_block(height).await?;
+            ensure!(
+                fetched.1.hash == node.hash(height).await?,
+                "backfill block {height} is not on the node's best chain"
+            );
+            fetched
+        }
+        result => result?,
+    };
+    let txids = transactions(node, backfill, &block.hash).await?;
+    Ok((json, block, txids))
+}
+
+/// The block's transaction IDs, from the backfill node if the node fails.
+async fn transactions(node: &Node, backfill: Option<&Node>, hash: &str) -> Result<Vec<String>> {
+    match (node.transactions(hash).await, backfill) {
+        (Err(e), Some(backfill)) if e.is::<RpcError>() => backfill.transactions(hash).await,
+        (result, _) => result,
+    }
+}
+
 /// The `meta` key of the highest height whose transactions are indexed.
 pub const TXINDEX: &str = "txindex_through";
 
@@ -523,6 +603,64 @@ mod tests {
         )?;
         follower(&db, &node, None, None).await?.sync().await?;
         assert_mirrors(&conn, &node, blocks[0].height)?;
+        Ok(())
+    }
+
+    /// Where, from request `from` on, the node first served `method` with
+    /// `params[0] == first`.
+    fn served_at(node: &FakeNode, from: usize, method: &str, first: &Value) -> Option<usize> {
+        node.data().requests[from..]
+            .iter()
+            .position(|(m, params)| m == method && &params[0] == first)
+    }
+
+    #[tokio::test]
+    async fn fetches_blocks_ahead_of_validation_and_commits_them_in_order() -> Result<()> {
+        let mut blocks = vec![genesis()];
+        populate_epoch(&mut blocks, 3)?;
+        for _ in 0..30 {
+            mine(&mut blocks)?;
+        }
+        let node = FakeNode::start(blocks.clone())?;
+        let db = TempDb::new();
+        let mut follower = follower(&db, &node, None, None).await?;
+        // Only the sync's requests: `Follower::new` fetches the tip block.
+        let from = node.data().requests.len();
+        follower.sync().await?;
+        assert_mirrors(&store::open(&db.0)?, &node, blocks[0].height)?;
+        // A serial follower asks for block h + 1 only after it has the
+        // transactions of block h. Fetching ahead asks before.
+        let ahead = blocks.windows(2).any(|pair| {
+            let next = served_at(
+                &node,
+                from,
+                "gettachyonblock",
+                &json!(pair[1].height.to_string()),
+            );
+            let txids = served_at(&node, from, "getblock", &json!(pair[0].hash));
+            next.zip(txids).is_some_and(|(next, txids)| next < txids)
+        });
+        assert!(ahead, "no block was fetched ahead");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_prefetch_restarts_at_a_height_it_did_not_expect() -> Result<()> {
+        let mut blocks = vec![genesis()];
+        for _ in 0..20 {
+            mine(&mut blocks)?;
+        }
+        let node = FakeNode::start(blocks.clone())?;
+        let tip = blocks.last().unwrap().height;
+        let mut ahead = Prefetch::new(Node::new(&node.url, None)?, None, tip);
+        let first = blocks[0].height;
+        assert_eq!(ahead.next(first).await?.1.hash, blocks[0].hash);
+        assert_eq!(ahead.next(first + 1).await?.1.hash, blocks[1].hash);
+        // After a reorg the follower asks for a lower height: the queue,
+        // fetched from the old chain, is dropped.
+        assert_eq!(ahead.next(first).await?.1.hash, blocks[0].hash);
+        assert_eq!(ahead.next(first + 7).await?.1.hash, blocks[7].hash);
+        assert_eq!(ahead.next(tip).await?.1.hash, blocks.last().unwrap().hash);
         Ok(())
     }
 
